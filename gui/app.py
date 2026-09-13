@@ -3,16 +3,12 @@ MovieShort AI — Gradio GUI
 """
 import glob
 import os
-import re
 import threading
 import time as time_module
 from pathlib import Path
-from typing import List, Tuple
-
 import gradio as gr
 
 import config as app_config
-from core.pipeline import process_multiple
 from core.batch import process_movie
 from core.subtitle import generate_word_group_srt, load_external_subtitles, save_segments_json
 from utils.ffmpeg_utils import render_full_preview, _probe_duration
@@ -555,25 +551,15 @@ footer { display: none; }
 
 /* ── Todo 50 v4 widths: full inventory per screenshots (1920px viewport).
     BEFORE: outer .block widths already == panelContent (1414) but inner
-    insets differed — hint Markdown pad 0 (x253) vs .tc-range textarea
-    pad12 (input x265/1390) vs gr-group heading pad0 (x253) vs checkbox
-    rows pad12 (x253 block but label at x265). Visually three different
-    left edges. Group content not unified. Subtitle dropdown outer
-    already == panelContent (1390) — verified, no fix needed there.
+    insets differed — hint Markdown pad 0 (x253) vs gr-group heading pad0
+    (x253) vs checkbox rows pad12 (x253 block but label at x265). Visually
+    three different left edges. Group content not unified. Subtitle
+    dropdown outer already == panelContent (1390) — verified, no fix
+    needed there.
     AFTER: force listed controls to 100% of container and unify group
     content to 12px horizontal padding. Multi-column rows (banner Top/
     Bottom 699px, Size/Outline 687px) remain half-width by design — documented
     exception: flex Row columns fill 50% each + 16px gap (todo 38). ── */
-.gradio-container .tc-range.block {
-    width: 100% !important;
-    box-sizing: border-box !important;
-    padding-left: 12px !important;
-    padding-right: 12px !important;
-}
-.gradio-container .tc-range.block textarea {
-    width: 100% !important;
-    box-sizing: border-box !important;
-}
 /* Hint Markdown block (hide-container, pad 0 before → unify to 12).
    Specificity bump: .padded is present on the element (class="block ... padded hide-container")
    so include it to outrank theme's .block.padded rule. */
@@ -687,11 +673,6 @@ footer { display: none; }
 
 # Force Gradio's dark palette regardless of OS/browser preference: first run
 # redirects to ?__theme=dark, after the reload the guard makes it a no-op.
-# The same function installs the todo-22 delegated 'input' listener masking
-# .tc-range fields client-side — digits accumulate through the template
-# DDDDDD-DDDDDD ("000130000230" -> "00:01:30 - 00:02:30"); delegation on
-# document covers dynamically revealed fields. Mirrors _mask_timecode_range(),
-# which stays authoritative.
 # Todo 10 addition: Gradio's dropdown popup (ul.options) is position:fixed and
 # does NOT follow its anchor when the page scrolls under it -> the open list
 # visually tears away from its field. CSS overscroll-behavior stops the wheel
@@ -708,62 +689,6 @@ async () => {
         url.searchParams.set('__theme', 'dark');
         window.location.href = url.href;
     }
-    // CAPTURE phase: must run BEFORE Gradio's own input binding, otherwise
-    // svelte re-binds the raw unmasked value over ours.
-    document.addEventListener('input', function(e) {
-        const el = e.target;
-        if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) return;
-        // Gradio puts elem_classes on the component's wrapper div, not the
-        // native input — resolve via closest().
-        if (!el.closest('.tc-range')) return;
-        // Todo 22 range mask: digits are re-extracted from the value on every
-        // input, so backspace and pasted full ranges ("00:01:30 - 00:02:30")
-        // reflow naturally through the DDDDDD-DDDDDD template.
-        const d = (el.value || '').replace(/\\D/g, '').slice(0, 12);
-        const stamp = s => s.replace(/(..)/g, '$1:').replace(/:$/, '');
-        let out = stamp(d.slice(0, 6));
-        if (d.length > 6) out += ' - ' + stamp(d.slice(6));
-        el.value = out;  // caret jumps to end after reformat — accepted behavior
-        if (d.length === 12) {
-            // Autofocus next field. The server reveal (.change chain) can take
-            // >1s — longer than any fixed poll — so watch DOM mutations
-            // instead and focus the moment the next .tc-range wrapper renders
-            // visible. Gradio's own value-sync then yanks focus back to the
-            // edited field (implicit focus via setSelectionRange — verified
-            // live: focusout with zero .focus() calls), so re-assert briefly;
-            // every watcher self-stops (5s ceiling), nothing leaks.
-            const wraps = Array.prototype.slice.call(document.querySelectorAll('.tc-range'));
-            const nxt = wraps[wraps.indexOf(el.closest('.tc-range')) + 1];
-            if (nxt) {
-                // Gradio 4.44 renders Textbox as <textarea>, not <input>.
-                const tryFocus = function() {
-                    const visible = nxt.offsetParent !== null ||
-                        nxt.getBoundingClientRect().height > 0;
-                    if (!visible) return false;
-                    const inp = nxt.querySelector('input,textarea');
-                    if (inp && document.activeElement !== inp) inp.focus();
-                    return !!inp;
-                };
-                let ticks = 0;
-                const guard = setInterval(function() {
-                    const ae = document.activeElement;
-                    // Focus settled in ANY .tc-range (ours, or the user
-                    // deliberately moved on) -> stand down; 50x100ms ceiling.
-                    if ((ae && ae.closest && ae.closest('.tc-range')) ||
-                        ++ticks >= 50) { clearInterval(guard); return; }
-                    tryFocus();
-                }, 100);
-                if (!tryFocus()) {
-                    const mo = new MutationObserver(function() {
-                        if (tryFocus()) mo.disconnect();
-                    });
-                    mo.observe(document.body,
-                        { childList: true, subtree: true, attributes: true });
-                    setTimeout(function() { mo.disconnect(); }, 5000);
-                }
-            }
-        }
-    }, true);
     // Todo 10: close any open dropdown popup as soon as the page scrolls.
     document.addEventListener('scroll', function() {
         const ul = document.querySelector('ul.options');
@@ -1016,44 +941,6 @@ async () => {
 """
 
 
-def parse_timestamps(text: str) -> List[Tuple[str, str]]:
-    pairs = []
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(
-            r"(\d{1,2}:\d{2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2}:\d{2})", line
-        )
-        if m:
-            pairs.append((m.group(1), m.group(2)))
-    return pairs
-
-
-def _mask_timecode_range(text) -> str:
-    """Range timecode mask (todo 22): keep digits only, max 12; first 6
-    digits form "HH:MM:SS", the next 6 form the second stamp after " - ".
-
-    "000130000230"->"00:01:30 - 00:02:30",
-    "123456000030"->"12:34:56 - 00:00:30"; partial states mask by position
-    ("1234"->"12:34", "1234560"->"12:34:56 - 0"); garbage stripped the same
-    way. The client-side JS mask mirrors this exact algorithm; this server
-    version stays authoritative.
-    """
-    digits = re.sub(r"\D", "", str(text or ""))[:12]
-    if not digits:
-        return ""
-
-    def stamp(d):
-        return ":".join(d[i:i + 2] for i in range(0, len(d), 2))
-
-    first = stamp(digits[:6])
-    rest = digits[6:]
-    if not rest:
-        return first
-    return f"{first} - {stamp(rest)}"
-
-
 # ---------------------------------------------------------------------------
 # UI language dictionary
 # ---------------------------------------------------------------------------
@@ -1061,17 +948,15 @@ def _mask_timecode_range(text) -> str:
 UI = {
     "en": {
         "app_tagline": "Automatic movie clipping for YouTube Shorts",
-        "tab_manual": "Manual mode",
-        "tab_auto": "Automatic mode",
         "settings": "Settings",
-        "process": "Process",
         "auto_process": "Analyze & process queue",
         "file_label": "Select video file",
         "movie_title": "Movie title (optional)",
-        "tc_range": "Timecode",
-        "tc_hint": "Timecodes are added progressively: complete an interval and the next field appears",
         "clip_length_rule": "Every generated clip is 1-3 minutes long (fixed).",
-        "processing_opts": "Processing options",
+        "section_upload": "🎬 Movie & Subtitles",
+        "section_queue": "🗂️ Processing Queue",
+        "section_clip_settings": "🎯 Clip Settings",
+        "processing_opts": "⚙️ Processing Options",
         "subs_label": "Subtitles",
         "subs_info": "Required — every clip needs the uploaded subtitle file, this can't be turned off",
         "face_label": "Smart centering (Face tracking)",
@@ -1080,8 +965,6 @@ UI = {
         "banner_info": "Adds top/bottom padding for banners in YouTube editor",
         "banner_top": "Top padding (px)",
         "banner_bottom": "Bottom padding (px)",
-        "blur_label": "Blurred background",
-        "blur_info": "Fills empty space with a blurred copy of the video (9:16 format)",
         "anti_label": "Anti-copyright",
         "anti_info": "Subtle transformations (mirror, contrast, brightness) to bypass Content ID",
         "num_clips": "Number of clips",
@@ -1089,8 +972,6 @@ UI = {
         "score_threshold_info": "Minimum scene score (1-10) to include in results",
         "waiting": "Waiting...",
         "error_no_file": "Error: please upload a video file.",
-        "error_no_ts": "Error: please enter at least one time range",
-        "error_no_subtitle": "Error: please upload a subtitle file (.srt/.ass/.ssa/.vtt), or disable subtitles.",
         "subtitle_file_label": "Subtitle file (.srt/.ass/.ssa/.vtt)",
         "console": "Debug console",
         "subtitle_editor": "Subtitle Editor",
@@ -1128,7 +1009,6 @@ UI = {
         "reset_sub_ok": "✅ Subtitle settings reset to defaults",
         "add_to_queue": "Add to queue",
         "queue_empty": "Queue is empty",
-        "support_author": "Support the author:",
         "file_label_suffix": " — drag & drop or click to select",
         "movie_placeholder": "e.g. The Matrix, The Shawshank Redemption...",
         "queue_header": "Queue ({n})",
@@ -1397,572 +1277,304 @@ def create_app() -> gr.Blocks:
             elem_id="header-card",
         )
 
-        # Donation buttons — always visible above tabs
-        with gr.Row():
-            donate_text = _t("support_author", ui_lang)
-            gr.HTML(
-                value=f"""<div style="text-align:center;margin:-8px 0 6px 0;font-size:14px;">
-  <span style="color:#9C988B;">{donate_text}</span>
-   <a href="https://donatex.gg/donate/nzeronfourme" target="_blank"
-     style="display:inline-block;padding:4px 14px;margin:0 6px;
-            background:#C15F3C;color:white;border-radius:6px;
-            text-decoration:none;font-weight:500;font-size:13px;">
-    💸 DonateX
-  </a>
-  <a href="https://boosty.to/nzeronfourme/donate" target="_blank"
-     style="display:inline-block;padding:4px 14px;margin:0 6px;
-            background:#C15F3C;color:white;border-radius:6px;
-            text-decoration:none;font-weight:500;font-size:13px;">
-    🎗 Boosty
-  </a>
-</div>"""
-            )
-
         # Update notification banner (checked synchronously at startup)
         _banner_html = _check_for_update(ui_lang)
         if _banner_html:
             gr.HTML(value=_banner_html)
 
-        with gr.Tabs():
-            # ── Tab 1: Manual ──────────────────────────────────
-            with gr.Tab(_t("tab_manual", ui_lang)):
-                video_file = gr.File(
-                    label=_t("file_label", ui_lang) + _t("file_label_suffix", ui_lang),
-                    file_types=[".mp4", ".avi", ".mkv", ".mov"],
-                    elem_id="manual-file",
-                    elem_classes="film-upload film-upload-manual",
-                )
-                upload_progress = gr.HTML(value="", visible=True, elem_id="upload-progress")
-                # Progressive timecode ranges (todo 22): ONE field per interval
-                # "HH:MM:SS - HH:MM:SS"; field N+1 appears once field N carries
-                # all 12 digits; client JS masks digits and autofocuses the
-                # newly revealed field.
-                tc_boxes = []
-                for _i in range(12):
-                    tc_boxes.append(gr.Textbox(
-                        label=_t("tc_range", ui_lang),
-                        placeholder="00:01:30 - 00:02:30",
-                        elem_classes="tc-range",
-                        visible=(_i == 0),
-                    ))
-                gr.Markdown(f'<span style="font-size:12px;color:#9C988B">{_t("tc_hint", ui_lang)}</span>')
+        queue_state = gr.State([])
 
-                def _tc_reveal(val):
-                    """Show field N+1 once field N holds all 12 digits."""
-                    if len(re.sub(r"\D", "", str(val or ""))) >= 12:
-                        return gr.update(visible=True)
-                    return gr.update()
+        with gr.Group():
+            gr.Markdown(f"### {_t('section_upload', ui_lang)}")
+            auto_file = gr.File(
+                label=_t("file_label", ui_lang) + _t("file_label_suffix", ui_lang),
+                file_count="single",
+                elem_id="auto-file",
+                elem_classes="film-upload film-upload-auto",
+            )
+            auto_upload_progress = gr.HTML(value="", visible=True, elem_id="upload-progress-auto")
 
-                for _i in range(len(tc_boxes) - 1):
-                    tc_boxes[_i].change(
-                        fn=_tc_reveal, inputs=tc_boxes[_i],
-                        outputs=tc_boxes[_i + 1])
+            def _esc_html(s):
+                return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-                # Upload progress: per-tab, shows filename + Done for 1.5s
-                def _esc_html(s):
-                    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-                UPLOAD_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Uploading: file — </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
-                def _on_manual_upload(f):
-                    if f is None:
-                        return gr.update(value="", visible=False)
-                    try:
-                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "file"
-                    except Exception:
-                        name = "file"
-                    esc = _esc_html(name)
-                    done_html = f'<div class="upload-loading upload-done"><span>Done: {esc} </span><span class="upload-check">✓</span></div>'
-                    return gr.update(value=done_html, visible=True)
-                def _on_manual_upload_show():
-                    return gr.update(value=UPLOAD_LOADING_HTML, visible=True)
-                # upload fires when copying into Temp/gradio starts; change fires once it completes
+            AUTO_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Uploading: file \u2014 </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
+            def _on_auto_upload(f):
+                if f is None:
+                    return gr.update(value="", visible=False)
                 try:
-                    video_file.upload(fn=_on_manual_upload_show, inputs=None, outputs=upload_progress)
+                    name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "file"
                 except Exception:
-                    pass
-                video_file.change(fn=_on_manual_upload, inputs=video_file, outputs=upload_progress)
-                video_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=upload_progress)
-                subtitle_file = gr.File(
-                    label=_t("subtitle_file_label", ui_lang),
-                    file_types=[".srt", ".ass", ".ssa", ".vtt"],
-                    elem_id="manual-subtitle-file",
+                    name = "file"
+                esc = _esc_html(name)
+                done_html = f'<div class="upload-loading upload-done"><span>Done: {esc} </span><span class="upload-check">\u2713</span></div>'
+                return gr.update(value=done_html, visible=True)
+            def _on_auto_upload_show():
+                return gr.update(value=AUTO_LOADING_HTML, visible=True)
+            try:
+                auto_file.upload(fn=_on_auto_upload_show, inputs=None, outputs=auto_upload_progress)
+            except Exception:
+                pass
+            auto_file.change(fn=_on_auto_upload, inputs=auto_file, outputs=auto_upload_progress)
+            auto_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=auto_upload_progress)
+            auto_subtitle_file = gr.File(
+                label=_t("subtitle_file_label", ui_lang),
+                file_types=[".srt", ".ass", ".ssa", ".vtt"],
+                elem_id="auto-subtitle-file",
+            )
+            with gr.Row():
+                movie_title_box = gr.Textbox(
+                    label=_t("movie_title", ui_lang),
+                    placeholder=_t("movie_placeholder", ui_lang),
+                    scale=3,
                 )
-                with gr.Group():
-                    gr.Markdown(f"### {_t('processing_opts', ui_lang)}")
-                    m_subs = gr.Checkbox(value=True, interactive=False,
-                        label=_t("subs_label", ui_lang),
-                        info=_t("subs_info", ui_lang))
-                    m_face = gr.Checkbox(value=cfg.get("face_tracking", True),
-                        label=_t("face_label", ui_lang),
-                        info=_t("face_info", ui_lang))
-                    m_banner = gr.Checkbox(value=True,
-                        label=_t("banner_label", ui_lang),
-                        info=_t("banner_info", ui_lang))
-                    with gr.Row():
-                        m_banner_top = gr.Slider(0, 500, value=cfg.get("banner_top", 300),
-                            label=_t("banner_top", ui_lang))
-                        m_banner_bottom = gr.Slider(0, 500, value=cfg.get("banner_bottom", 300),
-                            label=_t("banner_bottom", ui_lang))
-                    m_blur = gr.Checkbox(value=cfg.get("blur_background", True),
-                        label=_t("blur_label", ui_lang),
-                        info=_t("blur_info", ui_lang))
-                    m_anti = gr.Checkbox(value=cfg.get("anti_copyright", True),
-                        label=_t("anti_label", ui_lang),
-                        info=_t("anti_info", ui_lang))
-                run_btn = gr.Button(_t("process", ui_lang), variant="primary")
-                manual_progress = gr.HTML(
-                    value=_make_progress_html(0, _t("wait_start", ui_lang)),
-                    elem_id="manual-progress",
+                add_queue_btn = gr.Button("➕ " + _t("add_to_queue", ui_lang),
+                    variant="secondary", scale=1, elem_id="add-queue-btn")
+
+        with gr.Group():
+            gr.Markdown(f"### {_t('section_queue', ui_lang)}")
+            queue_display = gr.HTML(value='<div style="color:#9C988B;padding:8px"><i>' + _t("queue_empty", ui_lang) + '</i></div>')
+
+        def _render_queue(q):
+            if not q:
+                return '<div style="color:#9C988B;padding:8px"><i>' + _t("queue_empty", ui_lang) + '</i></div>'
+            items = ""
+            for i, item in enumerate(q):
+                title_part = f" — {item['title']}" if item.get("title") else ""
+                sub_part = " 📝" if item.get("subtitle_path") else " ⚠️ no subtitles"
+                items += f'<div style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;align-items:center">'
+                items += f'<span style="margin-right:8px;font-weight:bold;color:#D4A27F">{i+1}.</span>'
+                items += f'<span>📁 {item["name"]}{title_part}{sub_part}</span></div>'
+            n = len(q)
+            label = _t("queue_header", ui_lang).format(n=n)
+            return f'<div style="border:1px solid rgba(255,255,255,0.12);border-radius:10px;max-height:200px;overflow-y:auto;background:rgba(26,24,20,0.5)"><div style="padding:6px 10px;background:rgba(255,255,255,0.06);font-weight:bold;border-bottom:1px solid rgba(255,255,255,0.12)">{label}</div>{items}</div>'
+
+        def _add_to_queue(q, file, subtitle_upload, title):
+            if file is None:
+                return q, _render_queue(q), None, None, title
+            import os
+            fpath = file.name if hasattr(file, "name") else str(file)
+            sub_path = None
+            if subtitle_upload is not None:
+                sub_path = subtitle_upload.name if hasattr(subtitle_upload, "name") else str(subtitle_upload)
+            new_item = {
+                "path": fpath,
+                "title": title or "",
+                "name": os.path.basename(fpath),
+                "subtitle_path": sub_path,
+            }
+            new_q = list(q or []) + [new_item]
+            return new_q, _render_queue(new_q), None, None, ""
+
+        add_queue_btn.click(
+            fn=_add_to_queue,
+            inputs=[queue_state, auto_file, auto_subtitle_file, movie_title_box],
+            outputs=[queue_state, queue_display, auto_file, auto_subtitle_file, movie_title_box],
+        ).then(fn=lambda: gr.update(value="", visible=False), inputs=[], outputs=[auto_upload_progress])
+        with gr.Group():
+            gr.Markdown(f"### {_t('section_clip_settings', ui_lang)}")
+            gr.Markdown(f"<span style='font-size:12px;color:#9C988B'>{_t('clip_length_rule', ui_lang)}</span>")
+            with gr.Row():
+                num_clips = gr.Slider(
+                    minimum=5, maximum=20, step=1,
+                    value=cfg.get("num_clips", 10),
+                    label=_t("num_clips", ui_lang)
                 )
-                manual_log = gr.Textbox(
-                    label=_t("console", ui_lang), lines=10, max_lines=20,
-                    interactive=False, elem_id="console-log",
-                    value=_t("wait_start", ui_lang) + "\n"
+                score_thresh = gr.Slider(
+                    minimum=1, maximum=10, step=0.5,
+                    value=cfg.get("score_threshold", 7.0),
+                    label=_t("score_threshold", ui_lang),
+                    info=_t("score_threshold_info", ui_lang),
                 )
+        with gr.Group():
+            gr.Markdown(f"### {_t('processing_opts', ui_lang)}")
+            a_subs = gr.Checkbox(value=True, interactive=False,
+                label=_t("subs_label", ui_lang),
+                info=_t("subs_info", ui_lang))
+            a_face = gr.Checkbox(value=cfg.get("face_tracking", True),
+                label=_t("face_label", ui_lang),
+                info=_t("face_info", ui_lang))
+            a_banner = gr.Checkbox(value=True,
+                label=_t("banner_label", ui_lang),
+                info=_t("banner_info", ui_lang))
+            with gr.Row():
+                a_banner_top = gr.Slider(0, 500, value=cfg.get("banner_top", 300),
+                    label=_t("banner_top", ui_lang))
+                a_banner_bottom = gr.Slider(0, 500, value=cfg.get("banner_bottom", 300),
+                    label=_t("banner_bottom", ui_lang))
+            a_anti = gr.Checkbox(value=cfg.get("anti_copyright", True),
+                label=_t("anti_label", ui_lang),
+                info=_t("anti_info", ui_lang))
+        auto_progress = gr.HTML(
+            value=_make_progress_html(0, _t("wait_start", ui_lang)),
+            elem_id="auto-progress",
+        )
+        auto_btn = gr.Button(_t("auto_process", ui_lang), variant="primary")
+        auto_log = gr.Textbox(
+            label=_t("console", ui_lang), lines=12, max_lines=20,
+            interactive=False, elem_id="console-log",
+            value=_t("wait_start", ui_lang) + "\n"
+        )
 
-                def on_process(file, subtitle_upload, subs, face, banner, bt, bb, blur, anti,
-                               sub_font_name, sub_size, sub_outline, sub_color_name,
-                               sub_bold, sub_italic, sub_shadow, sub_position,
-                               *tc_values, _lang=ui_lang):
-                    if file is None:
-                        yield (_t("error_no_file", _lang),
-                               _make_progress_html(0, _t("error_no_file", _lang)))
-                        return
-                    if subs and subtitle_upload is None:
-                        yield (_t("error_no_subtitle", _lang),
-                               _make_progress_html(0, _t("error_no_subtitle", _lang)))
-                        return
-                    # Assemble "start - end" lines from filled range-fields
-                    # (the mask already yields that shape); parse_timestamps
-                    # stays the final validator (todo 22).
-                    tc_lines = []
-                    for val in tc_values:
-                        masked = _mask_timecode_range(val)
-                        if " - " in masked:
-                            tc_lines.append(masked)
-                    pairs = parse_timestamps("\n".join(tc_lines))
-                    if not pairs:
-                        yield (_t("error_no_ts", _lang),
-                               _make_progress_html(0, _t("error_no_ts", _lang)))
-                        return
+        def on_auto_process(queue,
+                            n_clips, s_thresh,
+                            subs, face, banner, bt, bb, anti,
+                            sub_font_name, sub_size, sub_outline, sub_color_name,
+                            sub_bold, sub_italic, sub_shadow, sub_position,
+                            _lang=ui_lang):
+            if not queue:
+                yield (_t("error_no_file", _lang),
+                       _make_progress_html(0, _t("error_no_file", _lang)))
+                return
 
-                    video_path = file.name if hasattr(file, 'name') else str(file)
+            # Save current settings as defaults
+            cfg_save = user_config.load()
+            cfg_save["subtitles"] = subs
+            cfg_save["face_tracking"] = face
+            cfg_save["banner_top"] = bt
+            cfg_save["banner_bottom"] = bb
+            cfg_save["blur_background"] = True  # always on — no longer a user toggle
+            cfg_save["anti_copyright"] = anti
+            cfg_save["num_clips"] = n_clips
+            cfg_save["score_threshold"] = s_thresh
+            cleanup = cfg_save.get("auto_cleanup", True)
+            user_config.save(cfg_save)
 
-                    # Parse the uploaded external subtitle file into a transcript
-                    # JSON usable by process_clip (subtitle-only pipeline).
-                    transcript_path = None
-                    if subtitle_upload is not None:
-                        try:
-                            sub_path = subtitle_upload.name if hasattr(subtitle_upload, "name") else str(subtitle_upload)
-                            segments = load_external_subtitles(sub_path)
-                            os.makedirs(app_config.TEMP_DIR, exist_ok=True)
-                            transcript_path = str(app_config.TEMP_DIR / f"{Path(video_path).stem}_subs.json")
-                            save_segments_json(segments, transcript_path)
-                        except Exception as e:
-                            yield (f"Subtitle error: {e}", _make_progress_html(0, f"Subtitle error: {e}"))
-                            return
+            # Process each file in queue
+            all_results = []
+            total_files = len(queue)
+            for file_idx, item in enumerate(queue):
+                video_path = item["path"]
+                movie_title = item.get("title", "")
+                subtitle_path = item.get("subtitle_path")
 
-                    # --- subtitle style from Editor (R7b-7): must flow to pipeline ---
-                    _cmap = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
-                    _cval = _cmap.get(sub_color_name, "&H00FFFFFF")
+                # subtitle style (R7b-7) — Editor controls flow to pipeline
+                _cmap2 = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
+                _cval2 = _cmap2.get(sub_color_name, "&H00FFFFFF")
+                try:
+                    _font_family2 = ensure_font(sub_font_name, FONTS_DIR)
+                except Exception:
+                    _font_family2 = sub_font_name or "Arial"
+                _font_style2 = {"font": _font_family2, "size": int(sub_size) if sub_size is not None else 13, "color": _cval2, "outline": int(sub_outline) if sub_outline is not None else 1, "bold": bool(sub_bold), "italic": bool(sub_italic), "shadow": bool(sub_shadow), "position_y": int(sub_position) if sub_position is not None else 400}
+                settings = {
+                    # min/max duration intentionally omitted — fixed
+                    # 60-180s rule from config.DEFAULT_MIN/MAX_CLIP_DURATION,
+                    # not user-configurable.
+                    "subtitles": subs,
+                    "face_tracking": face,
+                    "anti_copyright": anti,
+                    "blur_background": True,  # always on — no longer a user toggle
+                    "banner_top": bt,
+                    "banner_bottom": bb,
+                    "num_clips": n_clips,
+                    "score_threshold": s_thresh,
+                    "movie_title": movie_title,
+                    "subtitle_path": subtitle_path,
+                    "auto_cleanup": cleanup,
+                    "subtitle_font_name": sub_font_name,
+                    "subtitle_font": _font_family2,
+                    "subtitle_size": int(sub_size) if sub_size is not None else 13,
+                    "subtitle_outline": int(sub_outline) if sub_outline is not None else 1,
+                    "subtitle_color": _cval2,
+                    "subtitle_bold": bool(sub_bold),
+                    "subtitle_italic": bool(sub_italic),
+                    "subtitle_shadow": bool(sub_shadow),
+                    "subtitle_position_y": int(sub_position) if sub_position is not None else 400,
+                    "font_style": _font_style2,
+                }
+
+                capture = LogCapture()
+                capture.start_capture()
+
+                file_label = os.path.basename(video_path)
+                print("=" * 60)
+                print(_t("movie_header", _lang).format(i=file_idx+1, total=total_files))
+                print(f"{_t('file_label', _lang)}: {file_label}")
+                print("=" * 60)
+                if movie_title:
+                    print(f"{_t('movie_title', _lang)}: {movie_title}")
+                print("LLM: local Ollama model")
+                if not subtitle_path:
+                    print("⚠️ No subtitle file attached — relying on automatic discovery next to the video file.")
+                print()
+
+                results_container = []
+                error_container = []
+
+                def worker():
                     try:
-                        _font_family = ensure_font(sub_font_name, FONTS_DIR)
-                    except Exception:
-                        _font_family = sub_font_name or "Arial"
-                    _font_style = {"font": _font_family, "size": int(sub_size) if sub_size is not None else 13, "color": _cval, "outline": int(sub_outline) if sub_outline is not None else 1, "bold": bool(sub_bold), "italic": bool(sub_italic), "shadow": bool(sub_shadow), "position_y": int(sub_position) if sub_position is not None else 400}
-                    _options = {
-                        "subtitles": subs,
-                        "face_tracking": face,
-                        "anti_copyright": anti,
-                        "blur_background": blur,
-                        "banner_top": bt,
-                        "banner_bottom": bb,
-                        "subtitle_font_name": sub_font_name,
-                        "subtitle_font": _font_family,
-                        "subtitle_size": int(sub_size) if sub_size is not None else 13,
-                        "subtitle_outline": int(sub_outline) if sub_outline is not None else 1,
-                        "subtitle_color": _cval,
-                        "subtitle_bold": bool(sub_bold),
-                        "subtitle_italic": bool(sub_italic),
-                        "subtitle_shadow": bool(sub_shadow),
-                        "subtitle_position_y": int(sub_position) if sub_position is not None else 400,
-                        "font_style": _font_style,
-                        "transcript_path": transcript_path,
-                    }
+                        results = process_movie(video_path, settings)
+                        results_container.append(results)
+                    except Exception as e:
+                        error_container.append(str(e))
+                        import traceback
+                        error_container.append(traceback.format_exc())
 
-                    capture = LogCapture()
-                    capture.start_capture()
+                thread = threading.Thread(target=worker, daemon=True)
+                thread.start()
 
-                    print(f"File: {os.path.basename(video_path)}")
-                    print(f"Timestamps: {len(pairs)}")
-                    print(f"Options: subs={subs}, face={face}, blur={blur}, anti={anti}")
+                all_lines = []
+                start_ts = time_module.time()
+                EST_TOTAL = 2100
+                last_pct = -1
 
-                    results_container = []
-                    error_container = []
-
-                    def worker():
-                        try:
-                            results = process_multiple(video_path, pairs, _options)
-                            results_container.append(results)
-                        except Exception as e:
-                            error_container.append(str(e))
-                            import traceback
-                            error_container.append(traceback.format_exc())
-
-                    thread = threading.Thread(target=worker, daemon=True)
-                    thread.start()
-
-                    all_lines = []
-                    start_ts = time_module.time()
-                    last_pct = -1
-                    while thread.is_alive():
-                        new_lines = capture.get_new_lines()
-                        has_new = bool(new_lines)
-                        if new_lines:
-                            all_lines.extend(new_lines)
-                        elapsed = time_module.time() - start_ts
-                        pct = min(95, int(elapsed / 120 * 100))
-                        if has_new or abs(pct - last_pct) >= 1:
-                            label = _t("processing_elapsed", _lang).format(time=_fmt_duration(elapsed))
-                            yield ("\n".join(all_lines[-40:]),
-                                   _make_progress_html(pct, label))
-                            last_pct = pct
-                        time_module.sleep(0.6)
-
-                    thread.join(timeout=2)
+                while thread.is_alive():
                     new_lines = capture.get_new_lines()
+                    has_new = bool(new_lines)
                     if new_lines:
                         all_lines.extend(new_lines)
+                    elapsed = time_module.time() - start_ts
+                    pct = min(97, int(elapsed / EST_TOTAL * 100))
+                    if has_new or abs(pct - last_pct) >= 1:
+                        label = _t("processing_file", _lang).format(i=file_idx+1, total=total_files, name=file_label, time=_fmt_duration(elapsed))
+                        yield ("\n".join(all_lines[-40:]),
+                               _make_progress_html(pct, label))
+                        last_pct = pct
+                    time_module.sleep(0.6)
 
-                    # T14: automatic Gradio temp cleanup after processing
-                    try:
-                        if file and hasattr(file, 'name'):
-                            p = str(file.name)
-                            if os.path.sep + "Temp" + os.path.sep in p or "gradio" in p.lower():
-                                import os as _os2
-                                _os2.unlink(p)
-                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} removed")
-                    except Exception:
-                        pass
-                    # fallback via helper (covers edge where p already in video_path)
-                    try:
-                        _try_remove_gradio_temp(video_path)
-                    except Exception:
-                        pass
+                thread.join(timeout=2)
+                new_lines = capture.get_new_lines()
+                if new_lines:
+                    all_lines.extend(new_lines)
 
-                    if error_container:
-                        print(f"\nERROR: {error_container[0]}")
-                        label = _t("progress_error", _lang)
-                    elif results_container:
-                        results = results_container[0]
-                        successes = [r for r in results if r is not None]
-                        print(f"\nDone: {len(successes)}/{len(results)} clips")
-                        for r in successes:
-                            print(f"  + {os.path.basename(r)}")
-                        for i, r in enumerate(results):
-                            if r is None:
-                                print(f"  - Clip {i+1}: processing error")
-                        label = _t("progress_done", _lang).format(
-                            done=len(successes), total=len(results))
-                        elapsed_total = time_module.time() - start_ts
-                        print(f"\n⏱  Total time: {_fmt_duration(elapsed_total)}")
-                    else:
-                        print("\nError: no result")
-                        label = _t("progress_error", _lang)
-
-                    capture.stop_capture()
-                    yield ("\n".join(capture.get_all()[-40:]),
-                           _make_progress_html(100, label))
-
-                # R7b-7: run_btn binding deferred after subtitle editor (needs sub_* inputs) — see bottom of subtitle editor tab
-
-            # ── Tab 2: Automatic ───────────────────────────────
-            with gr.Tab(_t("tab_auto", ui_lang)):
-                queue_state = gr.State([])
-
-                auto_file = gr.File(
-                    label=_t("file_label", ui_lang) + _t("file_label_suffix", ui_lang),
-                    file_count="single",
-                    elem_id="auto-file",
-                    elem_classes="film-upload film-upload-auto",
-                )
-                auto_upload_progress = gr.HTML(value="", visible=True, elem_id="upload-progress-auto")
-
-                AUTO_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Uploading: file \u2014 </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
-                def _on_auto_upload(f):
-                    if f is None:
-                        return gr.update(value="", visible=False)
-                    try:
-                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "file"
-                    except Exception:
-                        name = "file"
-                    esc = _esc_html(name)
-                    done_html = f'<div class="upload-loading upload-done"><span>Done: {esc} </span><span class="upload-check">\u2713</span></div>'
-                    return gr.update(value=done_html, visible=True)
-                def _on_auto_upload_show():
-                    return gr.update(value=AUTO_LOADING_HTML, visible=True)
+                # T14: automatic Gradio temp cleanup for batch mode
                 try:
-                    auto_file.upload(fn=_on_auto_upload_show, inputs=None, outputs=auto_upload_progress)
+                    p = str(video_path)
+                    if os.path.sep + "Temp" + os.path.sep in p or "gradio" in p.lower():
+                        import os as _os2
+                        _os2.unlink(p)
+                        print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} removed")
                 except Exception:
                     pass
-                auto_file.change(fn=_on_auto_upload, inputs=auto_file, outputs=auto_upload_progress)
-                auto_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=auto_upload_progress)
-                auto_subtitle_file = gr.File(
-                    label=_t("subtitle_file_label", ui_lang),
-                    file_types=[".srt", ".ass", ".ssa", ".vtt"],
-                    elem_id="auto-subtitle-file",
-                )
-                with gr.Row():
-                    movie_title_box = gr.Textbox(
-                        label=_t("movie_title", ui_lang),
-                        placeholder=_t("movie_placeholder", ui_lang),
-                        scale=3,
-                    )
-                    add_queue_btn = gr.Button("➕ " + _t("add_to_queue", ui_lang),
-                        variant="secondary", scale=1, elem_id="add-queue-btn")
-                queue_display = gr.HTML(value='<div style="color:#9C988B;padding:8px"><i>' + _t("queue_empty", ui_lang) + '</i></div>')
+                try:
+                    _try_remove_gradio_temp(video_path)
+                except Exception:
+                    pass
 
-                def _render_queue(q):
-                    if not q:
-                        return '<div style="color:#9C988B;padding:8px"><i>' + _t("queue_empty", ui_lang) + '</i></div>'
-                    items = ""
-                    for i, item in enumerate(q):
-                        title_part = f" — {item['title']}" if item.get("title") else ""
-                        sub_part = " 📝" if item.get("subtitle_path") else " ⚠️ no subtitles"
-                        items += f'<div style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;align-items:center">'
-                        items += f'<span style="margin-right:8px;font-weight:bold;color:#D4A27F">{i+1}.</span>'
-                        items += f'<span>📁 {item["name"]}{title_part}{sub_part}</span></div>'
-                    n = len(q)
-                    label = _t("queue_header", ui_lang).format(n=n)
-                    return f'<div style="border:1px solid rgba(255,255,255,0.12);border-radius:10px;max-height:200px;overflow-y:auto;background:rgba(26,24,20,0.5)"><div style="padding:6px 10px;background:rgba(255,255,255,0.06);font-weight:bold;border-bottom:1px solid rgba(255,255,255,0.12)">{label}</div>{items}</div>'
+                if results_container:
+                    all_results.extend(results_container[0])
 
-                def _add_to_queue(q, file, subtitle_upload, title):
-                    if file is None:
-                        return q, _render_queue(q), None, None, title
-                    import os
-                    fpath = file.name if hasattr(file, "name") else str(file)
-                    sub_path = None
-                    if subtitle_upload is not None:
-                        sub_path = subtitle_upload.name if hasattr(subtitle_upload, "name") else str(subtitle_upload)
-                    new_item = {
-                        "path": fpath,
-                        "title": title or "",
-                        "name": os.path.basename(fpath),
-                        "subtitle_path": sub_path,
-                    }
-                    new_q = list(q or []) + [new_item]
-                    return new_q, _render_queue(new_q), None, None, ""
+            # Final summary
+            if error_container:
+                print(f"\n{_t('error_generic', _lang).format(msg=error_container[0])}")
+                label = _t("error_short", _lang)
+            elif all_results:
+                s = [r for r in all_results if r is not None]
+                print(f"\n{_t('done_count', _lang).format(ok=len(s), total=len(all_results))}")
+                for r in s:
+                    print(f"  + {os.path.basename(r)}")
+                label = _t("done_count_files", _lang).format(ok=len(s), total=len(all_results), files=total_files)
+            else:
+                print(f"\n{_t('no_scenes', _lang)}")
+                label = _t("no_scenes_short", _lang)
 
-                add_queue_btn.click(
-                    fn=_add_to_queue,
-                    inputs=[queue_state, auto_file, auto_subtitle_file, movie_title_box],
-                    outputs=[queue_state, queue_display, auto_file, auto_subtitle_file, movie_title_box],
-                ).then(fn=lambda: gr.update(value="", visible=False), inputs=[], outputs=[auto_upload_progress])
-                gr.Markdown(f"<span style='font-size:12px;color:#9C988B'>{_t('clip_length_rule', ui_lang)}</span>")
-                with gr.Row():
-                    num_clips = gr.Slider(
-                        minimum=5, maximum=20, step=1,
-                        value=cfg.get("num_clips", 10),
-                        label=_t("num_clips", ui_lang)
-                    )
-                    score_thresh = gr.Slider(
-                        minimum=1, maximum=10, step=0.5,
-                        value=cfg.get("score_threshold", 7.0),
-                        label=_t("score_threshold", ui_lang),
-                        info=_t("score_threshold_info", ui_lang),
-                    )
-                with gr.Group():
-                    gr.Markdown(f"### {_t('processing_opts', ui_lang)}")
-                    a_subs = gr.Checkbox(value=True, interactive=False,
-                        label=_t("subs_label", ui_lang),
-                        info=_t("subs_info", ui_lang))
-                    a_face = gr.Checkbox(value=cfg.get("face_tracking", True),
-                        label=_t("face_label", ui_lang),
-                        info=_t("face_info", ui_lang))
-                    a_banner = gr.Checkbox(value=True,
-                        label=_t("banner_label", ui_lang),
-                        info=_t("banner_info", ui_lang))
-                    with gr.Row():
-                        a_banner_top = gr.Slider(0, 500, value=cfg.get("banner_top", 300),
-                            label=_t("banner_top", ui_lang))
-                        a_banner_bottom = gr.Slider(0, 500, value=cfg.get("banner_bottom", 300),
-                            label=_t("banner_bottom", ui_lang))
-                    a_blur = gr.Checkbox(value=cfg.get("blur_background", True),
-                        label=_t("blur_label", ui_lang),
-                        info=_t("blur_info", ui_lang))
-                    a_anti = gr.Checkbox(value=cfg.get("anti_copyright", True),
-                        label=_t("anti_label", ui_lang),
-                        info=_t("anti_info", ui_lang))
-                auto_progress = gr.HTML(
-                    value=_make_progress_html(0, _t("wait_start", ui_lang)),
-                    elem_id="auto-progress",
-                )
-                auto_btn = gr.Button(_t("auto_process", ui_lang), variant="primary")
-                auto_log = gr.Textbox(
-                    label=_t("console", ui_lang), lines=12, max_lines=20,
-                    interactive=False, elem_id="console-log",
-                    value=_t("wait_start", ui_lang) + "\n"
-                )
+            yield ("\n".join(capture.get_all()[-40:]),
+                   _make_progress_html(100, label))
 
-                def on_auto_process(queue,
-                                    n_clips, s_thresh,
-                                    subs, face, banner, bt, bb, blur, anti,
-                                    sub_font_name, sub_size, sub_outline, sub_color_name,
-                                    sub_bold, sub_italic, sub_shadow, sub_position,
-                                    _lang=ui_lang):
-                    if not queue:
-                        yield (_t("error_no_file", _lang),
-                               _make_progress_html(0, _t("error_no_file", _lang)))
-                        return
+        # Clear queue after processing; _render_queue is already defined above
+        def _clear_queue():
+            return [], _render_queue([])
 
-                    # Save current settings as defaults
-                    cfg_save = user_config.load()
-                    cfg_save["subtitles"] = subs
-                    cfg_save["face_tracking"] = face
-                    cfg_save["banner_top"] = bt
-                    cfg_save["banner_bottom"] = bb
-                    cfg_save["blur_background"] = blur
-                    cfg_save["anti_copyright"] = anti
-                    cfg_save["num_clips"] = n_clips
-                    cfg_save["score_threshold"] = s_thresh
-                    cleanup = cfg_save.get("auto_cleanup", True)
-                    user_config.save(cfg_save)
-
-                    # Process each file in queue
-                    all_results = []
-                    total_files = len(queue)
-                    for file_idx, item in enumerate(queue):
-                        video_path = item["path"]
-                        movie_title = item.get("title", "")
-                        subtitle_path = item.get("subtitle_path")
-
-                        # subtitle style (R7b-7) — Editor controls flow to pipeline
-                        _cmap2 = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
-                        _cval2 = _cmap2.get(sub_color_name, "&H00FFFFFF")
-                        try:
-                            _font_family2 = ensure_font(sub_font_name, FONTS_DIR)
-                        except Exception:
-                            _font_family2 = sub_font_name or "Arial"
-                        _font_style2 = {"font": _font_family2, "size": int(sub_size) if sub_size is not None else 13, "color": _cval2, "outline": int(sub_outline) if sub_outline is not None else 1, "bold": bool(sub_bold), "italic": bool(sub_italic), "shadow": bool(sub_shadow), "position_y": int(sub_position) if sub_position is not None else 400}
-                        settings = {
-                            # min/max duration intentionally omitted — fixed
-                            # 60-180s rule from config.DEFAULT_MIN/MAX_CLIP_DURATION,
-                            # not user-configurable.
-                            "subtitles": subs,
-                            "face_tracking": face,
-                            "anti_copyright": anti,
-                            "blur_background": blur,
-                            "banner_top": bt,
-                            "banner_bottom": bb,
-                            "num_clips": n_clips,
-                            "score_threshold": s_thresh,
-                            "movie_title": movie_title,
-                            "subtitle_path": subtitle_path,
-                            "auto_cleanup": cleanup,
-                            "subtitle_font_name": sub_font_name,
-                            "subtitle_font": _font_family2,
-                            "subtitle_size": int(sub_size) if sub_size is not None else 13,
-                            "subtitle_outline": int(sub_outline) if sub_outline is not None else 1,
-                            "subtitle_color": _cval2,
-                            "subtitle_bold": bool(sub_bold),
-                            "subtitle_italic": bool(sub_italic),
-                            "subtitle_shadow": bool(sub_shadow),
-                            "subtitle_position_y": int(sub_position) if sub_position is not None else 400,
-                            "font_style": _font_style2,
-                        }
-
-                        capture = LogCapture()
-                        capture.start_capture()
-
-                        file_label = os.path.basename(video_path)
-                        print("=" * 60)
-                        print(_t("movie_header", _lang).format(i=file_idx+1, total=total_files))
-                        print(f"{_t('file_label', _lang)}: {file_label}")
-                        print("=" * 60)
-                        if movie_title:
-                            print(f"{_t('movie_title', _lang)}: {movie_title}")
-                        print("LLM: local Ollama model")
-                        if not subtitle_path:
-                            print("⚠️ No subtitle file attached — relying on automatic discovery next to the video file.")
-                        print()
-
-                        results_container = []
-                        error_container = []
-
-                        def worker():
-                            try:
-                                results = process_movie(video_path, settings)
-                                results_container.append(results)
-                            except Exception as e:
-                                error_container.append(str(e))
-                                import traceback
-                                error_container.append(traceback.format_exc())
-
-                        thread = threading.Thread(target=worker, daemon=True)
-                        thread.start()
-
-                        all_lines = []
-                        start_ts = time_module.time()
-                        EST_TOTAL = 2100
-                        last_pct = -1
-
-                        while thread.is_alive():
-                            new_lines = capture.get_new_lines()
-                            has_new = bool(new_lines)
-                            if new_lines:
-                                all_lines.extend(new_lines)
-                            elapsed = time_module.time() - start_ts
-                            pct = min(97, int(elapsed / EST_TOTAL * 100))
-                            if has_new or abs(pct - last_pct) >= 1:
-                                label = _t("processing_file", _lang).format(i=file_idx+1, total=total_files, name=file_label, time=_fmt_duration(elapsed))
-                                yield ("\n".join(all_lines[-40:]),
-                                       _make_progress_html(pct, label))
-                                last_pct = pct
-                            time_module.sleep(0.6)
-
-                        thread.join(timeout=2)
-                        new_lines = capture.get_new_lines()
-                        if new_lines:
-                            all_lines.extend(new_lines)
-
-                        # T14: automatic Gradio temp cleanup for batch mode
-                        try:
-                            p = str(video_path)
-                            if os.path.sep + "Temp" + os.path.sep in p or "gradio" in p.lower():
-                                import os as _os2
-                                _os2.unlink(p)
-                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} removed")
-                        except Exception:
-                            pass
-                        try:
-                            _try_remove_gradio_temp(video_path)
-                        except Exception:
-                            pass
-
-                        if results_container:
-                            all_results.extend(results_container[0])
-
-                    # Final summary
-                    if error_container:
-                        print(f"\n{_t('error_generic', _lang).format(msg=error_container[0])}")
-                        label = _t("error_short", _lang)
-                    elif all_results:
-                        s = [r for r in all_results if r is not None]
-                        print(f"\n{_t('done_count', _lang).format(ok=len(s), total=len(all_results))}")
-                        for r in s:
-                            print(f"  + {os.path.basename(r)}")
-                        label = _t("done_count_files", _lang).format(ok=len(s), total=len(all_results), files=total_files)
-                    else:
-                        print(f"\n{_t('no_scenes', _lang)}")
-                        label = _t("no_scenes_short", _lang)
-
-                    yield ("\n".join(capture.get_all()[-40:]),
-                           _make_progress_html(100, label))
-
-                # Clear queue after processing; _render_queue is already defined above
-                def _clear_queue():
-                    return [], _render_queue([])
-
-                # R7b-7: auto_btn binding deferred after subtitle editor — see below
+        # R7b-7: auto_btn binding deferred after subtitle editor — see below
 
         # ── Settings ───────────────────────────────────────────
         with gr.Accordion(_t("settings", ui_lang), open=False):
@@ -2047,7 +1659,7 @@ def create_app() -> gr.Blocks:
                     def _run_video_preview(font_name, size, outline,
                                            color_name, bold, italic, shadow, pos,
                                            subs_on, face_on, banner_v, banner_top_v,
-                                           banner_bottom_v, blur_on, anti_on):
+                                           banner_bottom_v, anti_on):
                         """Render the FULL test video through the production
                         chain with the CURRENT auto-tab options + editor
                         style (todo 14b). Video path is auto-detected
@@ -2058,6 +1670,7 @@ def create_app() -> gr.Blocks:
                         the banner checkbox is accepted but NOT used there —
                         only the banner_top/banner_bottom slider values flow
                         into the pipeline, so preview passes them verbatim.
+                        Background blur is always on (no longer a toggle).
                         Never raises — every error lands in sub_status."""
                         lang = ui_lang
                         ok_html = '<span style="color:green">{}</span>'
@@ -2094,7 +1707,7 @@ def create_app() -> gr.Blocks:
                             options = {
                                 "banner_top": int(banner_top_v),
                                 "banner_bottom": int(banner_bottom_v),
-                                "blur": bool(blur_on),
+                                "blur": True,
                                 "anti_copyright": bool(anti_on),
                                 "face_tracking": bool(face_on),
                             }
@@ -2109,7 +1722,7 @@ def create_app() -> gr.Blocks:
                         inputs=[sub_font_dd, sub_size, sub_outline, sub_color,
                                 sub_bold, sub_italic, sub_shadow, sub_position,
                                 a_subs, a_face, a_banner, a_banner_top,
-                                a_banner_bottom, a_blur, a_anti],
+                                a_banner_bottom, a_anti],
                         outputs=[preview_video, sub_status])
 
                     _SAVE_COLOR_MAP = _COLOR_MAP_EN
@@ -2162,22 +1775,13 @@ def create_app() -> gr.Blocks:
                                  sub_status])
 
                     # ── R7b-7 wiring: final clips use Editor font (not default) ──
-                    # run_btn (manual) and auto_btn now include 8 subtitle controls
-                    run_btn.click(
-                        fn=on_process,
-                        inputs=[video_file, subtitle_file,
-                                m_subs, m_face, m_banner, m_banner_top, m_banner_bottom,
-                                m_blur, m_anti,
-                                sub_font_dd, sub_size, sub_outline, sub_color,
-                                sub_bold, sub_italic, sub_shadow, sub_position] + tc_boxes,
-                        outputs=[manual_log, manual_progress],
-                    )
+                    # auto_btn includes the 8 subtitle-style controls from this tab
                     auto_btn.click(
                         fn=on_auto_process,
                         inputs=[queue_state,
                                 num_clips, score_thresh,
                                 a_subs, a_face, a_banner, a_banner_top, a_banner_bottom,
-                                a_blur, a_anti,
+                                a_anti,
                                 sub_font_dd, sub_size, sub_outline, sub_color,
                                 sub_bold, sub_italic, sub_shadow, sub_position],
                         outputs=[auto_log, auto_progress],
