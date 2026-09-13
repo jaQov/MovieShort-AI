@@ -39,6 +39,14 @@ def call_llm(prompt_text: str, max_tokens: int = 256) -> str:
         "options": {
             "temperature": 0.3,
             "num_predict": max_tokens,
+            # Without this, Ollama silently falls back to its own default
+            # (commonly 4096) regardless of how much text batch.py packed
+            # into the prompt assuming config.DEFAULT_CONTEXT_TOKENS was
+            # actually available — a large enough batch would get truncated
+            # with no error. Measured on an RTX 3080: qwen3:8b stays 100% on
+            # GPU through num_ctx=16000; the model's own weights + a full
+            # 32000-token KV cache push it into a CPU/GPU split instead.
+            "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 16000),
         },
     }
 
@@ -140,6 +148,10 @@ def check_ollama() -> dict:
                 "options": {
                     "temperature": 0,
                     "num_predict": 4,
+                    # Match call_llm()'s num_ctx so this check doesn't force
+                    # Ollama to reload the model with a different context
+                    # size right before real work starts.
+                    "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 16000),
                 },
             },
             headers={"Content-Type": "application/json"},

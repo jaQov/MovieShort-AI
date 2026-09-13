@@ -48,6 +48,13 @@ LLM_MODEL = "qwen3:8b"
 # Local Ollama settings
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "qwen3:8b"
+# Context window sent to Ollama on every request. Without this, Ollama uses
+# its own default (commonly 4096) regardless of what the batching logic
+# above assumes is available. 16000 was measured to keep qwen3:8b fully
+# resident on a 10GB GPU (RTX 3080); going to the full 32000 pushed total
+# memory to ~10GB and forced a slow CPU/GPU split. Lower this if your GPU
+# has less VRAM, or if you switch to a larger model.
+OLLAMA_NUM_CTX = 16000
 
 # Anti-copyright measures (slight transformations to avoid Content ID)
 ANTI_COPYRIGHT = True           # master toggle
