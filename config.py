@@ -41,20 +41,18 @@ MIN_SCENE_DURATION = 15.0        # seconds — merge raw scenes shorter than thi
 MAX_MERGE_DURATION = 120         # seconds — don't merge beyond this (prevents giant scenes)
 DIALOGUE_PAUSE_THRESHOLD = 2.0   # seconds — gap > this = scene boundary
 
-# LLM — self-hosted local model only. No internet API or API key is required.
-LLM_BASE_URL = "http://127.0.0.1:11434"
-LLM_MODEL = "qwen3:8b"
-
-# Local Ollama settings
+# Local Ollama settings — self-hosted local model only, no API key required.
+#
+# Measured on an RTX 3080 10GB — model + OLLAMA_NUM_CTX combinations that
+# stayed 100% GPU-resident (`ollama ps`) vs. spilling to CPU:
+#   qwen3:8b          ->  OLLAMA_NUM_CTX = 16000  (fits; 32000 spills to CPU)
+#   mistral-nemo:12b  ->  OLLAMA_NUM_CTX = 8192   (fits; 10000 spills to CPU)
+# Re-measure with `ollama ps` after loading if you change either — a context
+# window Ollama can't fit alongside the model's weights forces a CPU/GPU
+# split, which is dramatically slower, not just "a bit slower".
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "qwen3:8b"
-# Context window sent to Ollama on every request. Without this, Ollama uses
-# its own default (commonly 4096) regardless of what the batching logic
-# above assumes is available. 16000 was measured to keep qwen3:8b fully
-# resident on a 10GB GPU (RTX 3080); going to the full 32000 pushed total
-# memory to ~10GB and forced a slow CPU/GPU split. Lower this if your GPU
-# has less VRAM, or if you switch to a larger model.
-OLLAMA_NUM_CTX = 16000
+OLLAMA_MODEL = "mistral-nemo:12b"
+OLLAMA_NUM_CTX = 8192
 
 # Anti-copyright measures (slight transformations to avoid Content ID)
 ANTI_COPYRIGHT = True           # master toggle
@@ -82,14 +80,13 @@ SUBTITLE_ITALIC = False
 SUBTITLE_SHADOW = False
 SUBTITLE_POSITION_Y = 400       # px from bottom
 
-# LLM batching for the local model's context window — fewer/larger calls
-# for models with more room, smaller calls for the default local model.
-MODEL_BATCH_SIZES = {"deepseek-v4-flash": 4, "nemotron-3-ultra-free": 4, "big-pickle": 3, "mimo-v2.5-free": 3, "hy3-free": 3, "nemotron-3.5-lightning-free": 3}
+# LLM batching — how many scene blocks go into one LLM call, and how the
+# prompt/output token budget is split. See OLLAMA_NUM_CTX above: the actual
+# context window is the single source of truth for both budgets (see
+# core/batch.py's _max_prompt_chars / _max_tokens_for).
 DEFAULT_LLM_BATCH_SIZE = 2
-MODEL_CONTEXT_TOKENS = {"deepseek-v4-flash": 1000000, "nemotron-3-ultra-free": 1000000, "big-pickle": 200000, "mimo-v2.5-free": 200000, "hy3-free": 190000, "nemotron-3.5-lightning-free": 262000}
-DEFAULT_CONTEXT_TOKENS = 32000
 PROMPT_CHARS_PER_TOKEN = 2.5     # estimate for English dialogue
-PROMPT_INPUT_BUDGET = 0.5        # half the context reserved for input (rest: 4096 output + overhead)
+PROMPT_INPUT_BUDGET = 0.5        # share of OLLAMA_NUM_CTX reserved for input (rest: output)
 
 # YouTube Shorts output filename hashtags (empty since R7b-9 — no hashtags in clip names)
 HASHTAGS = ""

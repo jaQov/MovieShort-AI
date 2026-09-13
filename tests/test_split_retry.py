@@ -28,6 +28,9 @@ def _valid_json_for(offset, count):
 def test_split_retry_on_null_batch(monkeypatch):
     """Batch 4 returns None, halves return valid JSON → merged with index correction."""
     blocks4 = _make_blocks(4)
+    # _max_tokens_for() scales off config.OLLAMA_NUM_CTX — pin it so this
+    # test doesn't depend on whatever model happens to be configured live.
+    monkeypatch.setattr(cb.config, "OLLAMA_NUM_CTX", 16000)
     # prevent merging/filtering/batching side effects
     monkeypatch.setattr(cb, "_merge_blocks_for_llm", lambda x, *a, **kw: x)
     monkeypatch.setattr(cb, "_is_credit_or_silent", lambda b: False)
@@ -66,8 +69,10 @@ def test_split_retry_on_null_batch(monkeypatch):
     # Should have recovered 4 clips via split-retry, before threshold filtering
     assert result is not None
     assert len(result) == 4
-    # max_tokens adaptive: first call for 4 blocks -> 8192, halves (2 each) -> 6144
-    assert calls[0] == 8192  # max(4096, min(8192, 4096*4//2+2048))=8192
+    # max_tokens adaptive, capped at half of OLLAMA_NUM_CTX=16000 -> 8000:
+    # first call for 4 blocks wants 10240, capped to 8000; halves (2 each)
+    # want 6144, under the cap so untouched.
+    assert calls[0] == 8000
     assert calls[1] == 6144
     assert calls[2] == 6144
     # check index correction: starts should be distinct and increasing
@@ -78,6 +83,7 @@ def test_split_retry_on_null_batch(monkeypatch):
 def test_single_block_null_no_loop(monkeypatch):
     """Single block null → no split, fallback to smart centering."""
     blocks1 = _make_blocks(1)
+    monkeypatch.setattr(cb.config, "OLLAMA_NUM_CTX", 16000)
     monkeypatch.setattr(cb, "_merge_blocks_for_llm", lambda x, *a, **kw: x)
     monkeypatch.setattr(cb, "_is_credit_or_silent", lambda b: False)
     monkeypatch.setattr(cb, "_split_batches", lambda blocks, bs, budget: [blocks])
@@ -96,7 +102,7 @@ def test_single_block_null_no_loop(monkeypatch):
     result = cb.find_best_clips_context("fake.mp4", "SingleFilm", max_duration=60, min_duration=15, num_clips=10, score_threshold=7.0)
     # single block should not loop; fallback creates 1 clip with score 5.0
     assert len(calls) == 1
-    assert calls[0] == 4096  # max(4096, min(8192, 4096*1//2+2048))=4096
+    assert calls[0] == 4096  # 4096*1//2+2048=4096, well under the 8000 cap
     assert result is not None
     assert len(result) == 1
     assert result[0]["score"] == 5.0

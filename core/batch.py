@@ -473,13 +473,26 @@ _TRUNCATE_FLOOR_CHARS = 200
 
 
 def _batch_size_for_model(model):
-    """Blocks per LLM call for the given model (default 2 for unknown models)."""
-    return config.MODEL_BATCH_SIZES.get(model, config.DEFAULT_LLM_BATCH_SIZE)
+    """Blocks per LLM call.
+
+    `model` is unused now that there's a single active local model — kept so
+    call sites don't need to change if per-model tuning is reintroduced later.
+    """
+    return config.DEFAULT_LLM_BATCH_SIZE
 
 
 def _max_prompt_chars(model):
-    """Prompt char budget: context tokens * chars/token estimate * input share."""
-    ctx = config.MODEL_CONTEXT_TOKENS.get(model, config.DEFAULT_CONTEXT_TOKENS)
+    """Prompt char budget: context tokens * chars/token estimate * input share.
+
+    `model` is unused now that there's a single active local model — kept so
+    call sites don't need to change. The context size that matters is
+    whatever config.OLLAMA_NUM_CTX actually tells Ollama to allocate (see
+    analyzers/text_analyzer.py's call_llm()), not a generic default: budgeting
+    against a bigger number than the model is actually given room for would
+    let a batch grow past what fits, and Ollama would silently drop whatever
+    doesn't fit rather than error.
+    """
+    ctx = getattr(config, "OLLAMA_NUM_CTX", 8192)
     return int(ctx * config.PROMPT_CHARS_PER_TOKEN * config.PROMPT_INPUT_BUDGET)
 
 
@@ -603,7 +616,7 @@ def find_best_clips_context(video_path, movie_title,
         print("  No blocks with dialogue — nothing to process")
         return None
 
-    model = config.LLM_MODEL
+    model = config.OLLAMA_MODEL
     batch_size = _batch_size_for_model(model)
     batch_template = PROMPT_BATCH_TO_CLIPS
     all_sub_clips = []
@@ -651,9 +664,16 @@ def find_best_clips_context(video_path, movie_title,
             pref_duration=(min_duration + max_duration) // 2,
         )
 
-        # T4: adaptive max_tokens
+        # T4: adaptive max_tokens, capped to whatever's actually left of the
+        # context window after _max_prompt_chars's input share — the old
+        # fixed 4096-8192 range was sized for a 16-32K context and would ask
+        # for more output than a smaller num_ctx (e.g. 8192) has room for
+        # once the input side is accounted for.
         def _max_tokens_for(n: int) -> int:
-            return max(4096, min(8192, 4096 * n // 2 + 2048))
+            ctx = getattr(config, "OLLAMA_NUM_CTX", 8192)
+            output_budget = max(1024, int(ctx * (1 - config.PROMPT_INPUT_BUDGET)))
+            requested = 4096 * n // 2 + 2048
+            return max(min(4096, output_budget), min(requested, output_budget))
 
         # Call LLM once for the entire batch
         raw_response = None

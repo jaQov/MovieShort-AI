@@ -23,9 +23,16 @@ def call_llm(prompt_text: str, max_tokens: int = 256) -> str:
 
     url = f"{base}/api/chat"
 
-    # Qwen3 supports /no_think. Scene scoring only needs the final structured
-    # answer, so disabling thinking makes the response faster and easier to parse.
-    ollama_prompt = "/no_think\n\n" + prompt_text
+    # /no_think is a Qwen3-specific directive that disables its "thinking"
+    # mode — scene scoring only needs the final structured answer, so
+    # skipping the reasoning trace makes the response faster and easier to
+    # parse. Other model families don't recognize it, so only send it to
+    # Qwen models; on anything else it'd just be meaningless text prepended
+    # to every prompt.
+    if "qwen" in model.lower():
+        ollama_prompt = "/no_think\n\n" + prompt_text
+    else:
+        ollama_prompt = prompt_text
 
     body = {
         "model": model,
@@ -41,12 +48,11 @@ def call_llm(prompt_text: str, max_tokens: int = 256) -> str:
             "num_predict": max_tokens,
             # Without this, Ollama silently falls back to its own default
             # (commonly 4096) regardless of how much text batch.py packed
-            # into the prompt assuming config.DEFAULT_CONTEXT_TOKENS was
-            # actually available — a large enough batch would get truncated
-            # with no error. Measured on an RTX 3080: qwen3:8b stays 100% on
-            # GPU through num_ctx=16000; the model's own weights + a full
-            # 32000-token KV cache push it into a CPU/GPU split instead.
-            "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 16000),
+            # into the prompt assuming config.OLLAMA_NUM_CTX was actually
+            # available — a large enough batch would get truncated with no
+            # error. See config.py's OLLAMA_NUM_CTX comment for measured
+            # per-model safe values on an RTX 3080.
+            "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 8192),
         },
     }
 
@@ -134,6 +140,9 @@ def check_ollama() -> dict:
 
         # Actually test inference so the GUI check confirms the model can
         # respond, not merely that Ollama is running.
+        probe_text = "Reply with exactly: OK"
+        if "qwen" in model.lower():
+            probe_text = "/no_think\n" + probe_text
         resp = httpx.post(
             f"{base}/api/chat",
             json={
@@ -141,7 +150,7 @@ def check_ollama() -> dict:
                 "messages": [
                     {
                         "role": "user",
-                        "content": "/no_think\nReply with exactly: OK",
+                        "content": probe_text,
                     }
                 ],
                 "stream": False,
@@ -151,7 +160,7 @@ def check_ollama() -> dict:
                     # Match call_llm()'s num_ctx so this check doesn't force
                     # Ollama to reload the model with a different context
                     # size right before real work starts.
-                    "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 16000),
+                    "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 8192),
                 },
             },
             headers={"Content-Type": "application/json"},

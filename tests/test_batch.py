@@ -199,50 +199,58 @@ def test_resolve_movie_title_given_no_warning(capsys):
     assert "Exact movie title not set" not in capsys.readouterr().out
 
 
-# --- T5: model-aware batch sizing + prompt budget guard ---
+# --- T5: batch sizing + prompt budget guard ---
+#
+# Since the cloud providers (Yandex/OpenRouter/OpenCode Zen) were removed,
+# there's a single active local model and _batch_size_for_model/
+# _max_prompt_chars no longer vary by model name — they read
+# config.DEFAULT_LLM_BATCH_SIZE / config.OLLAMA_NUM_CTX directly. Tests pin
+# those via monkeypatch rather than depend on whatever model is configured.
 
+import config as _config
 from core.batch import _batch_size_for_model, _max_prompt_chars, _prompt_content_chars, _split_batches
 
 TEMPLATE_LEN = 2000
 
 
-def test_batch_size_deepseek_is_4():
-    """deepseek-v4-flash is in MODEL_BATCH_SIZES → 4."""
-    assert _batch_size_for_model("deepseek-v4-flash") == 4
+def test_batch_size_is_the_configured_default(monkeypatch):
+    """Model name no longer matters — always DEFAULT_LLM_BATCH_SIZE."""
+    monkeypatch.setattr(_config, "DEFAULT_LLM_BATCH_SIZE", 4)
+    assert _batch_size_for_model("mistral-nemo:12b") == 4
+    assert _batch_size_for_model("anything-else") == 4
 
 
-def test_batch_size_default_2_unknown_model():
-    """Unknown model name → DEFAULT_LLM_BATCH_SIZE = 2."""
-    assert _batch_size_for_model("totally-unknown-model") == 2
+def test_max_prompt_chars_scales_with_num_ctx(monkeypatch):
+    """ctx * 2.5 chars/token * 0.5 input budget."""
+    monkeypatch.setattr(_config, "OLLAMA_NUM_CTX", 1_000_000)
+    assert _max_prompt_chars("mistral-nemo:12b") == 1_250_000
 
 
-def test_max_prompt_chars_deepseek():
-    """1M context * 2.5 chars/token * 0.5 input budget = 1_250_000."""
-    assert _max_prompt_chars("deepseek-v4-flash") == 1_250_000
-
-
-def test_normal_blocks_keep_batch_8():
-    """24 small blocks + deepseek limit → six batches of exactly 4, no truncation."""
+def test_normal_blocks_keep_batch_8(monkeypatch):
+    """24 small blocks + a generous context → six batches of exactly 4, no truncation."""
+    monkeypatch.setattr(_config, "OLLAMA_NUM_CTX", 1_000_000)
+    monkeypatch.setattr(_config, "DEFAULT_LLM_BATCH_SIZE", 4)
     blocks = [
         {"start": i * 120, "end": (i + 1) * 120, "text": "Short dialogue." * 10}
         for i in range(24)
     ]
-    limit = _max_prompt_chars("deepseek-v4-flash")
-    batches = _split_batches(blocks, _batch_size_for_model("deepseek-v4-flash"), limit - TEMPLATE_LEN)
+    limit = _max_prompt_chars("mistral-nemo:12b")
+    batches = _split_batches(blocks, _batch_size_for_model("mistral-nemo:12b"), limit - TEMPLATE_LEN)
     assert len(batches) == 6
     assert all(len(b) == 4 for b in batches)
     # nothing truncated
     assert all(len(blk["text"]) == len(blocks[0]["text"]) for b in batches for blk in b)
 
 
-def test_oversized_dialogues_fit_limit():
-    """12 huge-dialogue blocks + unknown model (32K default) → every batch fits, dialogues truncated, 200-char floor."""
+def test_oversized_dialogues_fit_limit(monkeypatch):
+    """12 huge-dialogue blocks + a small context → every batch fits, dialogues truncated, 200-char floor."""
+    monkeypatch.setattr(_config, "OLLAMA_NUM_CTX", 16_000)  # int(16000*2.5*0.5) = 20_000
     big = "words " * 10000  # 60_000 chars per dialogue
     blocks = [
         {"start": i * 120, "end": (i + 1) * 120, "text": big}
         for i in range(12)
     ]
-    limit = _max_prompt_chars("unknown-small-context-model")  # int(32000*2.5*0.5) = 40_000
+    limit = _max_prompt_chars("mistral-nemo:12b")
     batches = _split_batches(blocks, 2, limit - TEMPLATE_LEN)
     assert len(batches) == 12  # halved down to single-block batches
     for b in batches:
@@ -251,30 +259,6 @@ def test_oversized_dialogues_fit_limit():
         for blk in b:
             assert len(blk["text"]) >= 200          # floor respected
             assert len(blk["text"]) < len(big)      # actually truncated
-
-
-def test_batch_size_nemotron_is_4():
-    assert _batch_size_for_model("nemotron-3-ultra-free") == 4
-
-
-def test_batch_size_big_pickle_is_3():
-    assert _batch_size_for_model("big-pickle") == 3
-
-
-def test_batch_size_mimo_is_3():
-    assert _batch_size_for_model("mimo-v2.5-free") == 3
-
-
-def test_batch_size_hy3_is_3():
-    assert _batch_size_for_model("hy3-free") == 3
-
-
-def test_max_prompt_chars_nemotron_1M():
-    assert _max_prompt_chars("nemotron-3-ultra-free") == 1250000
-
-
-def test_max_prompt_chars_big_pickle_200K():
-    assert _max_prompt_chars("big-pickle") == 250000
 
 
 def test_console_batch_before_block():
