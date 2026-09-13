@@ -7,6 +7,9 @@ import time as time_module
 import warnings
 from pathlib import Path
 
+import html
+import re
+
 import config
 from utils import fmt_duration as _fmt_duration
 
@@ -345,3 +348,403 @@ def _format_srt_time(seconds):
     s = int(seconds % 60)
     ms = int((seconds - int(seconds)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def find_external_subtitle(video_path, explicit_path=None):
+    """
+    Find an external subtitle file for a movie.
+
+    Priority:
+      1. Explicit subtitle path supplied by the user.
+      2. Exact movie filename with .srt/.ass/.ssa/.vtt.
+      3. Common language suffixes such as .en, .eng, .english.
+
+    Returns:
+        str path to subtitle file, or None if no subtitle was found.
+    """
+    video_path = Path(video_path)
+
+    # 1. Explicit subtitle path
+    if explicit_path:
+        explicit = Path(str(explicit_path))
+        if explicit.exists() and explicit.is_file():
+            return str(explicit)
+
+    # 2. Exact matching filename
+    extensions = [".srt", ".ass", ".ssa", ".vtt"]
+
+    for ext in extensions:
+        candidate = video_path.with_suffix(ext)
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+
+    # 3. Common language suffixes
+    language_suffixes = [
+        ".en",
+        ".eng",
+        ".english",
+        ".en-US",
+        ".en-GB",
+    ]
+
+    for suffix in language_suffixes:
+        for ext in extensions:
+            candidate = video_path.with_name(video_path.stem + suffix + ext)
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+
+    return None
+
+
+def _read_subtitle_file(path):
+    """Read subtitle text with several common encodings."""
+    path = Path(path)
+
+    encodings = [
+        "utf-8-sig",
+        "utf-8",
+        "cp1252",
+        "cp1251",
+        "latin-1",
+    ]
+
+    last_error = None
+
+    for encoding in encodings:
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                return f.read()
+        except UnicodeDecodeError as e:
+            last_error = e
+        except OSError:
+            raise
+
+    raise UnicodeDecodeError(
+        "subtitle",
+        b"",
+        0,
+        1,
+        f"Could not decode subtitle file: {path} ({last_error})",
+    )
+
+
+def _parse_subtitle_timestamp(value):
+    """
+    Parse subtitle timestamp into seconds.
+
+    Supports:
+      00:01:23,456
+      00:01:23.456
+      0:01:23.45
+      01:23.456
+    """
+    value = value.strip().replace(",", ".")
+
+    parts = value.split(":")
+
+    try:
+        if len(parts) == 3:
+            hours = float(parts[0])
+            minutes = float(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600 + minutes * 60 + seconds
+
+        if len(parts) == 2:
+            minutes = float(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60 + seconds
+
+        return float(value)
+
+    except ValueError:
+        return None
+
+
+def _clean_subtitle_text(text):
+    """
+    Clean subtitle formatting while preserving meaningful sound/action cues.
+
+    Examples preserved:
+        [door slams]
+        (grunts)
+        ♪ dramatic music ♪
+        [phone ringing]
+
+    Formatting tags such as <i>...</i> and ASS override tags are removed.
+    """
+    text = html.unescape(text)
+
+    # ASS formatting overrides: {\i1}, {\an8}, {\pos(...)} etc.
+    text = re.sub(r"\{[^}]*\}", "", text)
+
+    # HTML subtitle formatting.
+    text = re.sub(r"<[^>]+>", "", text)
+
+    # ASS newline markers.
+    text = text.replace(r"\N", "\n")
+    text = text.replace(r"\n", "\n")
+
+    # Remove excessive whitespace while preserving line breaks.
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+
+    return " ".join(lines).strip()
+
+
+def _parse_srt(text):
+    """Parse SRT subtitles into the internal MovieShort segment format."""
+    segments = []
+
+    # Normalize line endings.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Split on blank lines between subtitle entries.
+    entries = re.split(r"\n\s*\n", text)
+
+    timestamp_re = re.compile(
+        r"^\s*"
+        r"(\d{1,2}:\d{2}:\d{2}[,.]\d+)"
+        r"\s*-->\s*"
+        r"(\d{1,2}:\d{2}:\d{2}[,.]\d+)"
+    )
+
+    for entry in entries:
+        lines = [line.strip() for line in entry.split("\n") if line.strip()]
+
+        if not lines:
+            continue
+
+        timestamp_index = None
+
+        for i, line in enumerate(lines):
+            if timestamp_re.match(line):
+                timestamp_index = i
+                break
+
+        if timestamp_index is None:
+            continue
+
+        match = timestamp_re.match(lines[timestamp_index])
+
+        start = _parse_subtitle_timestamp(match.group(1))
+        end = _parse_subtitle_timestamp(match.group(2))
+
+        if start is None or end is None or end <= start:
+            continue
+
+        subtitle_text = " ".join(lines[timestamp_index + 1:])
+        subtitle_text = _clean_subtitle_text(subtitle_text)
+
+        if not subtitle_text:
+            continue
+
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": subtitle_text,
+            # External subtitles normally do not contain word timestamps.
+            "words": [],
+        })
+
+    return segments
+
+
+def _parse_ass(text):
+    """
+    Parse ASS/SSA dialogue events.
+
+    ASS timestamps use:
+        H:MM:SS.cc
+
+    We locate the [Events] section and read Dialogue lines.
+    """
+    segments = []
+
+    in_events = False
+    format_fields = None
+
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        if line.startswith("["):
+            in_events = line.lower() == "[events]"
+            format_fields = None
+            continue
+
+        if not in_events:
+            continue
+
+        if line.lower().startswith("format:"):
+            format_fields = [
+                field.strip().lower()
+                for field in line.split(":", 1)[1].split(",")
+            ]
+            continue
+
+        if not line.lower().startswith("dialogue:"):
+            continue
+
+        data = line.split(":", 1)[1].lstrip()
+
+        # ASS dialogue normally has 10 comma-separated fields, but the
+        # Text field can itself contain commas. Split only the first
+        # N-1 separators.
+        if format_fields:
+            field_count = len(format_fields)
+        else:
+            field_count = 10
+
+        fields = data.split(",", field_count - 1)
+
+        if len(fields) < 3:
+            continue
+
+        if format_fields:
+            try:
+                start_index = format_fields.index("start")
+                end_index = format_fields.index("end")
+                text_index = format_fields.index("text")
+            except ValueError:
+                start_index = 1
+                end_index = 2
+                text_index = len(fields) - 1
+        else:
+            # Standard ASS format:
+            # Layer, Start, End, Style, Name, MarginL, MarginR,
+            # MarginV, Effect, Text
+            start_index = 1
+            end_index = 2
+            text_index = 9
+
+        if max(start_index, end_index, text_index) >= len(fields):
+            continue
+
+        start = _parse_subtitle_timestamp(fields[start_index])
+        end = _parse_subtitle_timestamp(fields[end_index])
+
+        if start is None or end is None or end <= start:
+            continue
+
+        subtitle_text = _clean_subtitle_text(fields[text_index])
+
+        if not subtitle_text:
+            continue
+
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": subtitle_text,
+            "words": [],
+        })
+
+    return segments
+
+
+def _parse_vtt(text):
+    """Parse basic WebVTT subtitles."""
+    segments = []
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    timestamp_re = re.compile(
+        r"^\s*"
+        r"(\d{1,2}:\d{2}(?::\d{2})?\.\d+)"
+        r"\s*-->\s*"
+        r"(\d{1,2}:\d{2}(?::\d{2})?\.\d+)"
+    )
+
+    entries = re.split(r"\n\s*\n", text)
+
+    for entry in entries:
+        lines = [line.strip() for line in entry.split("\n")]
+
+        match = None
+        timestamp_index = None
+
+        for i, line in enumerate(lines):
+            m = timestamp_re.match(line)
+            if m:
+                match = m
+                timestamp_index = i
+                break
+
+        if not match:
+            continue
+
+        start = _parse_subtitle_timestamp(match.group(1))
+        end = _parse_subtitle_timestamp(match.group(2))
+
+        if start is None or end is None or end <= start:
+            continue
+
+        subtitle_text = " ".join(
+            line for line in lines[timestamp_index + 1:] if line
+        )
+        subtitle_text = _clean_subtitle_text(subtitle_text)
+
+        if not subtitle_text:
+            continue
+
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": subtitle_text,
+            "words": [],
+        })
+
+    return segments
+
+
+def load_external_subtitles(subtitle_path):
+    """
+    Load an external subtitle file.
+
+    Supported:
+      .srt
+      .ass
+      .ssa
+      .vtt
+
+    Returns the same segment structure used by Whisper.
+    """
+    subtitle_path = Path(subtitle_path)
+
+    if not subtitle_path.exists():
+        raise FileNotFoundError(
+            f"Missing subtitles: {subtitle_path}"
+        )
+
+    text = _read_subtitle_file(subtitle_path)
+    extension = subtitle_path.suffix.lower()
+
+    if extension == ".srt":
+        segments = _parse_srt(text)
+    elif extension in (".ass", ".ssa"):
+        segments = _parse_ass(text)
+    elif extension == ".vtt":
+        segments = _parse_vtt(text)
+    else:
+        raise ValueError(
+            f"Unsupported subtitle format: {extension}"
+        )
+
+    # Sort by timestamp.
+    segments.sort(key=lambda s: (s["start"], s["end"]))
+
+    if not segments:
+        raise ValueError(
+            f"Subtitle file contains no usable subtitles: {subtitle_path.name}"
+        )
+
+    print(
+        f"  External subtitles loaded: "
+        f"{subtitle_path.name} ({len(segments)} cues)"
+    )
+
+    return segments

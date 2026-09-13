@@ -10,7 +10,11 @@ import os
 
 from scenedetect import open_video, SceneManager, ContentDetector
 
-from core.subtitle import transcribe, _transcribe_audio_file
+from core.subtitle import (
+    find_external_subtitle,
+    load_external_subtitles,
+    save_segments_json,
+)
 import config
 
 
@@ -516,40 +520,219 @@ def get_scene_transcripts(video_path, scenes, language=None):
     return results
 
 
-def detect_and_transcribe(video_path, language=None):
+def detect_and_transcribe(video_path, language=None, subtitle_path=None):
     """
-    Convenience function: detect_scenes -> merge_short_scenes -> get_scene_transcripts.
-    Returns final list.
+    Detect scenes and map an external subtitle file onto those scenes.
 
-    Args:
-        video_path: path to video file
-        language: transcription language code (None = config default)
+    IMPORTANT:
+        Whisper is intentionally NOT used here.
+
+    Subtitles are mandatory for the automatic pipeline. If no subtitle
+    file can be found, this function raises a clear Missing subtitles error.
+
+    Supported subtitle formats:
+        .srt
+        .ass
+        .ssa
+        .vtt
     """
+
+    # ------------------------------------------------------------------
+    # 1. Find subtitles BEFORE doing expensive scene/transcription work.
+    # ------------------------------------------------------------------
+    subtitle_path = find_external_subtitle(
+        video_path,
+        explicit_path=subtitle_path,
+    )
+
+    if not subtitle_path:
+        raise RuntimeError(
+            "Missing subtitles: no .srt, .ass, .ssa or .vtt subtitle "
+            "file was found for this movie."
+        )
+
+    print()
+    print("=" * 50)
+    print("SUBTITLE INPUT")
+    print("=" * 50)
+    print(f"  Using subtitles: {os.path.basename(subtitle_path)}")
+
+    # ------------------------------------------------------------------
+    # 2. Parse subtitles.
+    # ------------------------------------------------------------------
+    try:
+        subtitle_segments = load_external_subtitles(subtitle_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Missing subtitles / subtitle parsing failed: {e}"
+        ) from e
+
+    if not subtitle_segments:
+        raise RuntimeError(
+            f"Missing subtitles: {os.path.basename(subtitle_path)} "
+            "contains no usable subtitle cues."
+        )
+
+    print(
+        f"  ✓ Loaded {len(subtitle_segments)} subtitle cues"
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Detect visual scenes.
+    # ------------------------------------------------------------------
     scenes = detect_scenes(video_path)
     merged = merge_short_scenes(scenes)
 
     for m in merged:
         m["cut_count"] = sum(
-            1 for r in scenes
-            if r["start"] >= m["start"] and r["end"] <= m["end"]
+            1
+            for r in scenes
+            if r["start"] >= m["start"]
+            and r["end"] <= m["end"]
         )
 
     if not merged:
-        # Fallback: whole video as one scene
         print("  No scenes detected, treating whole video as one scene")
-        merged = [{"start": 0, "end": 0, "duration": 0}]
-        # Try to get video duration
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries",
-                 "format=duration", "-of",
-                 "default=noprint_wrappers=1:nokey=1", str(video_path)],
-                capture_output=True, text=True, check=True, timeout=30
-            )
-            duration = float(result.stdout.strip())
-            merged = [{"start": 0, "end": duration, "duration": duration}]
-        except Exception:
-            pass
 
-    return get_scene_transcripts(video_path, merged, language)
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+
+            duration = float(result.stdout.strip())
+
+        except Exception:
+            duration = (
+                subtitle_segments[-1]["end"]
+                if subtitle_segments
+                else 0
+            )
+
+        merged = [{
+            "start": 0,
+            "end": duration,
+            "duration": duration,
+            "cut_count": 0,
+        }]
+
+    # ------------------------------------------------------------------
+    # 4. Map subtitles to scenes.
+    #
+    # No audio extraction.
+    # No Whisper.
+    # No speech recognition.
+    # ------------------------------------------------------------------
+    results = []
+
+    for i, scene in enumerate(merged):
+        scene_start = scene["start"]
+        scene_end = scene["end"]
+
+        overlapping = [
+            seg
+            for seg in subtitle_segments
+            if seg["start"] < scene_end
+            and seg["end"] > scene_start
+        ]
+
+        text_parts = [
+            seg["text"].strip()
+            for seg in overlapping
+            if seg.get("text", "").strip()
+        ]
+
+        block = {
+            "start": scene_start,
+            "end": scene_end,
+            "duration": scene_end - scene_start,
+            "text": " ".join(text_parts),
+            "pause_points": [],
+            "cut_count": scene.get("cut_count", 0),
+            # Do NOT mark subtitle-only blocks as silence.
+            "audio_peaks": {
+                "peak_rms": 0.0,
+                "loud_peak_count": 0,
+                "silence_ratio": 0.0,
+            },
+        }
+
+        # Detect pauses between subtitle cues.
+        for j in range(len(overlapping) - 1):
+            gap = (
+                overlapping[j + 1]["start"]
+                - overlapping[j]["end"]
+            )
+
+            if gap > 0.8:
+                block["pause_points"].append(
+                    round(overlapping[j]["end"], 3)
+                )
+
+        results.append(block)
+
+        if (i + 1) % 20 == 0:
+            print(
+                f"  Mapped subtitles to "
+                f"{i + 1}/{len(merged)} scenes"
+            )
+
+    # ------------------------------------------------------------------
+    # 5. Save the normalized subtitle transcript to the existing cache.
+    #
+    # This is important because the rendering pipeline already knows how
+    # to consume transcript JSON. We reuse that mechanism instead of
+    # introducing another rendering path.
+    # ------------------------------------------------------------------
+    try:
+        import hashlib
+
+        video_basename = get_video_basename(video_path)
+
+        hash_input = (
+            f"{video_path}_"
+            f"{subtitle_path}_"
+            f"{os.path.getmtime(subtitle_path)}"
+        )
+
+        file_hash = hashlib.md5(
+            hash_input.encode()
+        ).hexdigest()[:8]
+
+        cache_path = (
+            Path(config.CACHE_DIR)
+            / f"full_transcript_{video_basename}_{file_hash}.json"
+        )
+
+        save_segments_json(
+            subtitle_segments,
+            cache_path,
+        )
+
+        print(
+            f"  Subtitle transcript cache: "
+            f"{cache_path.name}"
+        )
+
+    except Exception as e:
+        print(
+            f"  ⚠ Could not save subtitle cache: {e}"
+        )
+
+    print(
+        f"  ✓ {len(results)} scenes mapped to subtitles"
+    )
+
+    return results
