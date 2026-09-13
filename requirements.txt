@@ -1,0 +1,29 @@
+# MovieShort AI - dependencies
+# Install: python -m pip install -r requirements.txt
+#
+# NOTE: PyTorch with CUDA is installed by setup.bat separately.
+# If you installed CPU-only, run setup.bat and choose Y for CUDA.
+
+# Speech recognition (4x faster than openai-whisper)
+faster-whisper>=1.0.0
+
+# Scene detection (latest is 0.6.x, NOT 1.x)
+scenedetect[opencv]>=0.6,<1.0
+
+# Computer vision (Haar cascade for face detection)
+opencv-python>=4.5.0
+
+# GUI (version range for Python compatibility)
+# Gradio 5.4+ relaxes pillow<11.0 → <12.0, enabling Python 3.14 support
+gradio>=5.4.0,<6.0
+gradio_client>=1.4.2,<2.0
+huggingface_hub>=0.22.2,<1.0
+
+# HTTP client for LLM API
+httpx>=0.24.0
+
+# ML backend (CPU baseline — CUDA installed separately)
+torch>=2.0.0
+
+# Audio processing
+soundfile>=0.12.0

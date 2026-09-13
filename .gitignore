@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Environment
+venv/
+.venv/
+env/
+
+# Output files (generated clips)
+output/
+!output/.gitkeep
+
+# OpenCode internals
+.omo/
+
+# Media files (large - avoid accidental commit)
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wav
+*.mp3
+
+# Subtitle files
+*.srt
+*.ass
+
+# User config (contains API keys)
+user_config.json
+
+# Models (large binary files)
+models/*.onnx
+models/*.bin
+models/*.pt
+models/*.pth
+
+# Pytest
+.pytest_cache/
+
+# Temp files
+*.tmp
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+config.py.backup
+user_config.json.bak
+*.backup
