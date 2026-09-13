@@ -16,6 +16,7 @@ from utils.log_capture import LogCapture
 from utils import user_config
 from utils.font_manager import POPULAR_FONTS, ensure_font, FONTS_DIR
 from analyzers.text_analyzer import check_ollama
+from analyzers.visual_analyzer import check_vision_model
 from utils import fmt_duration
 
 
@@ -1018,6 +1019,8 @@ UI = {
         "local_model_no_key": "No API key needed.",
         "check_key": "Check connection",
         "status_not_checked": "⏳ not checked",
+        "vision_model_label": "Vision model",
+        "vision_model_info": "looks at one frame per scene so action/emotion with little or no dialogue (a fight, a chase, a silent reveal) still gets picked up.",
         "color_white": "White",
         "color_yellow": "Yellow",
         "color_black": "Black",
@@ -1589,6 +1592,14 @@ def create_app() -> gr.Blocks:
                     local_model_status = gr.HTML(
                         value='<span style="color:#9C988B">' + _t("status_not_checked", ui_lang) + '</span>',
                     )
+                    gr.Markdown(
+                        f"**{_t('vision_model_label', ui_lang)}:** `{app_config.OLLAMA_VISION_MODEL}` — "
+                        f"{_t('vision_model_info', ui_lang)}"
+                    )
+                    check_vision_model_btn = gr.Button(_t("check_key", ui_lang), variant="secondary")
+                    vision_model_status = gr.HTML(
+                        value='<span style="color:#9C988B">' + _t("status_not_checked", ui_lang) + '</span>',
+                    )
                 # ── Subtitle Editor tab ──
                 with gr.Tab(_t("subtitle_editor", ui_lang)):
                     initial_fs = _get_font_style(cfg)
@@ -1818,6 +1829,15 @@ def create_app() -> gr.Blocks:
                 return f'<span style="color:red">❌ {error}</span>'
 
             check_local_model_btn.click(fn=verify_local_model, inputs=[], outputs=[local_model_status])
+
+            def verify_vision_model():
+                result = check_vision_model()
+                if result["ok"]:
+                    return f'<span style="color:green">{_t("api_ok", "en")}</span>'
+                error = result.get("error", _t("status_unknown", "en"))
+                return f'<span style="color:red">❌ {error}</span>'
+
+            check_vision_model_btn.click(fn=verify_vision_model, inputs=[], outputs=[vision_model_status])
 
     return app
 

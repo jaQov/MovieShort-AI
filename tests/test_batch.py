@@ -2,6 +2,7 @@
 import pytest
 from core.batch import _snap_scene_boundary, _diversity_filter, _deduplicate_clips
 from core.batch import _resolve_movie_title
+from core.batch import _is_credit_or_silent
 
 
 def test_snap_to_sentence_end():
@@ -266,3 +267,63 @@ def test_console_batch_before_block():
     src = Path("core/batch.py").read_text(encoding="utf-8")
     # console order: Batch header before Block line
     assert src.index("Batch {batch_num}") < src.index("Block {global_idx+1}")
+
+
+# ---------------------------------------------------------------------------
+# _is_credit_or_silent — dialogue-silent blocks rescued by a visual caption
+# ---------------------------------------------------------------------------
+
+def test_silent_block_dropped_without_visual():
+    """No dialogue, no visual description → filtered (unchanged old behavior)."""
+    block = {"text": "", "audio_peaks": {"silence_ratio": 0.1}}
+    assert _is_credit_or_silent(block) is True
+
+
+def test_silent_block_rescued_by_interesting_visual():
+    """No dialogue but the vision model describes real action → kept."""
+    block = {
+        "text": "",
+        "visual": "Two men fighting violently in a dark alley.",
+        "audio_peaks": {"silence_ratio": 0.1},
+    }
+    assert _is_credit_or_silent(block) is False
+
+
+def test_silent_block_not_rescued_by_static_visual():
+    """No dialogue and the vision model describes an empty/static shot → still filtered."""
+    block = {
+        "text": "",
+        "visual": "A black screen, nothing happening.",
+        "audio_peaks": {"silence_ratio": 0.1},
+    }
+    assert _is_credit_or_silent(block) is True
+
+
+def test_credits_text_dropped_even_with_interesting_visual():
+    """Explicit credits text is always filtered, regardless of visuals."""
+    block = {
+        "text": "Subtitles by example.com — synced by someone",
+        "visual": "An intense car chase through a city street.",
+        "audio_peaks": {"silence_ratio": 0.0},
+    }
+    assert _is_credit_or_silent(block) is True
+
+
+def test_block_with_real_dialogue_kept_regardless_of_visual():
+    """Enough dialogue on its own is still sufficient, exactly like before."""
+    block = {
+        "text": "This is a long enough line of real dialogue to pass the filter easily.",
+        "visual": "",
+        "audio_peaks": {"silence_ratio": 0.0},
+    }
+    assert _is_credit_or_silent(block) is False
+
+
+def test_mostly_silent_audio_rescued_by_visual():
+    """High silence_ratio alone used to drop a block — a visual description saves it."""
+    block = {
+        "text": "",
+        "visual": "A tense standoff, two characters staring each other down.",
+        "audio_peaks": {"silence_ratio": 0.95},
+    }
+    assert _is_credit_or_silent(block) is False

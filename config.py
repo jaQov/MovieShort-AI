@@ -55,6 +55,36 @@ OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "qwen3:8b"
 OLLAMA_NUM_CTX = 16000
 
+# Visual analysis (local vision model) — runs alongside the text model above
+# so a scene with real action or emotion but little/no dialogue (a fight, a
+# chase, a silent reveal) doesn't get treated as "nothing happening" just
+# because the subtitle track is quiet there. One sample frame per scene
+# block gets captioned by this model; the caption is added to the same
+# prompt the text model sees, and also rescues otherwise-silent blocks from
+# being filtered out before the text model even gets to see them.
+#
+# qwen3-vl:8b (~6.1GB on disk, `ollama pull qwen3-vl:8b`) — a real
+# vision-language model rather than a lightweight captioner (moondream was
+# tried first; qwen3-vl's scene/action understanding is meaningfully
+# better, which is the entire point of this feature). It only needs to fit
+# in VRAM on its own: this runs as its own pass BEFORE the text model's
+# batch calls (see core/batch.py), so Ollama loads/unloads each model in
+# turn rather than needing both resident at once on the 10GB card.
+#
+# Like qwen3:8b, this model "thinks" before answering — measured on an
+# RTX 3080, and confirmed /no_think does NOT suppress it for image inputs
+# the way it does for the text model — so num_predict must stay generous
+# (see VISION_NUM_PREDICT below) or the reasoning trace eats the whole
+# budget and no actual caption comes back.
+#
+# If the model isn't pulled or Ollama can't reach it, this auto-disables
+# itself and the pipeline falls back to dialogue-only scoring, exactly
+# like before this feature existed.
+OLLAMA_VISION_MODEL = "qwen3-vl:8b"
+VISUAL_ANALYSIS_ENABLED = True
+VISUAL_ANALYSIS_TIMEOUT_SECONDS = 60   # per block: ffmpeg frame grab + vision inference (incl. thinking)
+VISION_NUM_PREDICT = 500                # generous — most of it is the model's hidden reasoning trace
+
 # Anti-copyright measures (slight transformations to avoid Content ID)
 ANTI_COPYRIGHT = True           # master toggle
 AC_MIRROR = True                # horizontal flip

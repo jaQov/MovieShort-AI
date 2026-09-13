@@ -9,6 +9,7 @@ from pathlib import Path
 
 import config
 from analyzers.text_analyzer import call_llm
+from analyzers.visual_analyzer import is_visually_interesting
 from core.pipeline import process_multiple
 from core.subtitle import find_external_subtitle, load_segments_json
 from utils import get_video_basename
@@ -23,13 +24,28 @@ _CREDITS_RE = re.compile(
 
 
 def _is_credit_or_silent(block):
-    """True if block should be filtered: no text, <30 chars, credits, or silence_ratio>0.85."""
+    """True if block should be filtered out entirely.
+
+    Credits/junk subtitle text is always filtered, regardless of visuals.
+    A block with little/no dialogue (<30 chars) or mostly silent audio is
+    ONLY filtered if its visual description (from the vision model, see
+    analyzers/visual_analyzer.py) also shows nothing interesting — a real
+    fight, chase, or silent emotional beat can carry a clip even with no
+    dialogue at all, which text-only analysis used to miss entirely.
+    """
     text = (block.get("text") or "").strip()
-    if not text or len(text) < 30 or _CREDITS_RE.search(text):
+    if _CREDITS_RE.search(text):
         return True
+
+    visually_interesting = is_visually_interesting(block.get("visual"))
+
+    if (not text or len(text) < 30) and not visually_interesting:
+        return True
+
     audio_peaks = block.get("audio_peaks") or {}
-    if audio_peaks.get("silence_ratio", 0) > 0.85:
+    if audio_peaks.get("silence_ratio", 0) > 0.85 and not visually_interesting:
         return True
+
     return False
 
 
@@ -465,8 +481,9 @@ def _merge_blocks_for_llm(blocks, target_duration=120, max_duration=150):
 
 # --- Model-aware batch sizing + prompt budget guard (T5) ---
 
-# Chars per block around the dialogue (timestamps, labels, joiner) — estimate
-_BLOCK_FRAMING_CHARS = 200
+# Chars per block around the dialogue (timestamps, labels, joiner, and the
+# "Visual: ..." line's own framing) — estimate
+_BLOCK_FRAMING_CHARS = 260
 # Minimum dialogue chars kept when a single-block batch still overflows the budget
 _TRUNCATE_FLOOR_CHARS = 200
 
@@ -496,9 +513,12 @@ def _max_prompt_chars(model):
 
 
 def _prompt_content_chars(batch_blocks):
-    """Estimated prompt chars contributed by a batch's blocks (framing + dialogue)."""
+    """Estimated prompt chars contributed by a batch's blocks (framing +
+    dialogue + visual caption)."""
     return sum(
-        _BLOCK_FRAMING_CHARS + len(b.get("text", "").strip() or "(no dialogue)")
+        _BLOCK_FRAMING_CHARS
+        + len(b.get("text", "").strip() or "(no dialogue)")
+        + len(b.get("visual", "").strip() or "(not analyzed)")
         for b in batch_blocks
     )
 
@@ -610,6 +630,13 @@ def find_best_clips_context(video_path, movie_title,
           f"sections (~{super_target}s each, so there's enough dialogue in "
           f"each one for the AI to judge) to send to the AI for scoring")
 
+    # Step 1.55: Visual analysis — caption one sample frame per section with
+    # a local vision model. Runs BEFORE the silence filter below so a
+    # dialogue-free section (a fight, a chase, a silent reveal) can survive
+    # on its visual description alone instead of being dropped as "silent".
+    from analyzers.visual_analyzer import describe_blocks
+    blocks = describe_blocks(video_path, blocks)
+
     # Step 1.6: Filter out silent / credits / music blocks
     before_filter = len(blocks)
     blocks = [b for b in blocks if not _is_credit_or_silent(b)]
@@ -650,17 +677,21 @@ def find_best_clips_context(video_path, movie_title,
             block_end = block["end"]
             block_dur = block_end - block_start
             dialogue = block.get("text", "").strip() or "(no dialogue)"
+            visual = block.get("visual", "").strip() or "(not analyzed)"
             cut_count = block.get("cut_count", 0)
             pause_points = block.get("pause_points", [])
 
             dialogue_preview = (dialogue[:80] + "...") if len(dialogue) > 80 else dialogue
+            visual_preview = (visual[:80] + "...") if len(visual) > 80 else visual
             print(f"\n  Block {global_idx+1}/{len(blocks)}: {_format_time(block_start)}-{_format_time(block_end)} ({block_dur:.0f}s)")
             print(f"    Dialogue: {dialogue_preview}")
+            print(f"    Visual: {visual_preview}")
             print(f"    Cuts: {cut_count}, Pauses: {len(pause_points)}")
 
             block_texts.append(
                 f"--- BLOCK {i} ({_format_time(block_start)}-{_format_time(block_end)}, {block_dur:.0f}s) ---\n"
                 f"Dialogue: {dialogue}\n"
+                f"Visual: {visual}\n"
                 f"Cut count: {cut_count} (high = action)\n"
                 f"Dialogue pauses: {pause_points}"
             )
@@ -728,11 +759,13 @@ def find_best_clips_context(video_path, movie_title,
                     sb_end = sb["end"]
                     sb_dur = sb_end - sb_start
                     dlg = sb.get("text", "").strip() or "(no dialogue)"
+                    vis = sb.get("visual", "").strip() or "(not analyzed)"
                     cc = sb.get("cut_count", 0)
                     pp = sb.get("pause_points", [])
                     sub_texts.append(
                         f"--- BLOCK {j} ({_format_time(sb_start)}-{_format_time(sb_end)}, {sb_dur:.0f}s) ---\n"
                         f"Dialogue: {dlg}\n"
+                        f"Visual: {vis}\n"
                         f"Cut count: {cc} (high = action)\n"
                         f"Dialogue pauses: {pp}"
                     )
