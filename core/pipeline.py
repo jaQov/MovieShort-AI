@@ -1,6 +1,11 @@
 """
 MovieShort AI — Pipeline orchestrator.
 Connects FFmpeg clipping, subtitle generation, face tracking, and vertical crop.
+
+The automatic movie pipeline is subtitle-only. External subtitle files are
+parsed before clip selection and the resulting transcript JSON is used here
+for final subtitle generation. Whisper is intentionally not used as a
+fallback.
 """
 import os
 import re
@@ -15,8 +20,9 @@ from utils.ffmpeg_utils import (
     _detect_gpu_accel,
 )
 from core.subtitle import (
-    transcribe, generate_srt, generate_word_group_srt,
-    load_segments_json, filter_segments_in_range
+    generate_word_group_srt,
+    load_segments_json,
+    filter_segments_in_range,
 )
 from core.processor import apply_vertical_crop
 from utils.font_manager import FONTS_DIR, ensure_font
@@ -157,7 +163,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
             - banner_top (int): top banner padding (default 300)
             - banner_bottom (int): bottom banner padding (default 300)
             - font_style (dict): subtitle font settings
-            - transcript_path (str): path to pre-transcribed JSON
+            - transcript_path (str): path to parsed external-subtitle JSON
             - movie_title (str): movie name used in the output filename
         title: optional short clip title to include in output filename
 
@@ -197,46 +203,64 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
         print(f"[1/5] Cutting {start_time} - {end_time}...")
         clip_video(video_path, start_time, end_time, raw_clip, gpu_opts=gpu_opts)
 
-        # Step 2: Generate subtitles
+        # Step 2: Generate subtitles from the external-subtitle transcript.
+        #
+        # IMPORTANT:
+        # The automatic pipeline is subtitle-only.
+        # Never transcribe the clip with Whisper here.
         if subtitles_enabled:
             transcript_path = options.get("transcript_path")
-            if transcript_path and os.path.exists(transcript_path):
-                print("[2/5] Generating subtitles from pre-transcribed segments...")
-                start_sec = _time_to_seconds(start_time)
-                end_sec = _time_to_seconds(end_time)
-                all_segments = load_segments_json(transcript_path)
-                clip_segments = filter_segments_in_range(all_segments, start_sec, end_sec)
-                if clip_segments:
-                    sub_path = _write_subtitles(clip_segments, str(config.TEMP_DIR / clip_name))
-                    print(f"      {len(clip_segments)} segments → word-group SRT")
-                else:
-                    print("      No speech in this clip — skipping subtitles")
-                    subtitles_enabled = False
-                # Use raw clip for face tracking (audio is already in raw_clip)
-                clip_with_audio = raw_clip
-            else:
-                # Fallback: transcribe the clip
-                print("[2/5] Transcribing clip audio...")
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", raw_clip, "-c", "copy",
-                     "-avoid_negative_ts", "make_zero", clip_with_audio],
-                    capture_output=True, check=True, timeout=120
+
+            if not transcript_path or not os.path.exists(transcript_path):
+                raise RuntimeError(
+                    "Missing subtitles: no parsed subtitle transcript "
+                    "was provided for this clip."
                 )
-                segments = transcribe(clip_with_audio)
-                if segments:
-                    sub_path = _write_subtitles(segments, str(config.TEMP_DIR / clip_name))
-                    print(f"      {len(segments)} segments transcribed")
-                else:
-                    print("      No speech detected — skipping subtitles")
-                    subtitles_enabled = False
-        else:
+
+            print("[2/5] Generating subtitles from external subtitle transcript...")
+
+            start_sec = _time_to_seconds(start_time)
+            end_sec = _time_to_seconds(end_time)
+
+            all_segments = load_segments_json(transcript_path)
+
+            clip_segments = filter_segments_in_range(
+                all_segments,
+                start_sec,
+                end_sec,
+            )
+
+            if not clip_segments:
+                raise RuntimeError(
+                    "Missing subtitles: selected clip contains no "
+                    "subtitle cues."
+                )
+
+            sub_path = _write_subtitles(
+                clip_segments,
+                str(config.TEMP_DIR / clip_name),
+            )
+
+            print(
+                f"      {len(clip_segments)} subtitle segments → word-group SRT"
+            )
+
+            # External subtitles are already attached to the source timeline,
+            # so the original cut remains the clip with its audio.
             clip_with_audio = raw_clip
+        else:
+            # Automatic movie processing is subtitle-only. Do not allow a
+            # subtitle-disabled path to silently bypass the required transcript.
+            raise RuntimeError(
+                "Missing subtitles: subtitles are required for automatic "
+                "movie processing."
+            )
 
         # Step 3: Scale to fit content area (1080 × content_h, preserves aspect ratio)
         if face_tracking_enabled:
             print("[3/5] Scaling to Shorts format...")
             apply_vertical_crop(
-                clip_with_audio if subtitles_enabled else raw_clip,
+                clip_with_audio,
                 vertical_clip,
                 anti_copyright=anti_copyright,
                 banner_top=banner_top,
@@ -245,7 +269,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
         else:
             print("[3/5] Scaling to Shorts format...")
             convert_to_vertical(
-                clip_with_audio if subtitles_enabled else raw_clip,
+                clip_with_audio,
                 vertical_clip,
                 anti_copyright=anti_copyright,
                 banner_top=banner_top,
@@ -254,34 +278,54 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
             )
 
         # Step 4: Embed subtitles (on content-area video, before banner padding)
-        if subtitles_enabled and os.path.exists(sub_path) and os.path.getsize(sub_path) > 0:
+        if os.path.exists(sub_path) and os.path.getsize(sub_path) > 0:
             print("[4/5] Embedding subtitles...")
             subtitled_clip = str(config.TEMP_DIR / f"{clip_name}_subs.mp4")
-            embed_subtitles(vertical_clip, sub_path, subtitled_clip,
-                           font_style=font_style, banner_top=banner_top,
-                           banner_bottom=banner_bottom, gpu_opts=gpu_opts,
-                           fontsdir=os.path.abspath(FONTS_DIR))
+            embed_subtitles(
+                vertical_clip,
+                sub_path,
+                subtitled_clip,
+                font_style=font_style,
+                banner_top=banner_top,
+                banner_bottom=banner_bottom,
+                gpu_opts=gpu_opts,
+                fontsdir=os.path.abspath(FONTS_DIR),
+            )
         else:
-            print("[4/5] Skipping subtitle embed...")
+            raise RuntimeError(
+                "Missing subtitles: subtitle SRT could not be generated."
+            )
 
         # Step 5: Blurred background → full 9:16 output
         if blur_enabled:
             print("[5/5] Adding blurred background...")
-            blur_background(subtitled_clip, final_output,
-                          enabled=True, banner_top=banner_top, banner_bottom=banner_bottom,
-                          gpu_opts=gpu_opts)
+            blur_background(
+                subtitled_clip,
+                final_output,
+                enabled=True,
+                banner_top=banner_top,
+                banner_bottom=banner_bottom,
+                gpu_opts=gpu_opts,
+            )
         else:
             print("[5/5] Padding to full frame (no blur)...")
             # If blur disabled, pad the content-area video to full 9:16
-            pad_with_banners(subtitled_clip, final_output,
-                           banner_top=banner_top, banner_bottom=banner_bottom,
-                           gpu_opts=gpu_opts)
+            pad_with_banners(
+                subtitled_clip,
+                final_output,
+                banner_top=banner_top,
+                banner_bottom=banner_bottom,
+                gpu_opts=gpu_opts,
+            )
 
         print(f"Done! → {final_output}")
         return final_output
 
     except FFmpegError as e:
         print(f"FFmpeg error: {e}")
+        return None
+    except RuntimeError as e:
+        print(f"❌ {e}")
         return None
     except subprocess.TimeoutExpired:
         print("Processing timed out")
@@ -343,7 +387,14 @@ def process_multiple(video_path, timestamps_list, options=None, titles=None, max
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {}
         for i, (start, end) in enumerate(timestamps_list):
-            future = executor.submit(process_clip, video_path, start, end, options, title=titles[i])
+            future = executor.submit(
+                process_clip,
+                video_path,
+                start,
+                end,
+                options,
+                title=titles[i],
+            )
             future_to_idx[future] = i
 
         for future in as_completed(future_to_idx):
