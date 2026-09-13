@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 import config
+from utils.clip_log import log, set_clip_label, get_clip_label
 
 # ---------------------------------------------------------------------------
 # Cascade cache
@@ -32,9 +33,10 @@ def _download_cascade(filename: str, url: str) -> Path:
     if not path.exists():
         import urllib.request
         _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"[face] Downloading {filename}...")
+        log(f"  First-time setup: downloading the {filename} face/person "
+            "detection model (only happens once)...")
         urllib.request.urlretrieve(url, path)
-        print(f"[face] Download complete: {filename}")
+        log(f"  Downloaded {filename}")
     return path
 
 
@@ -167,11 +169,13 @@ def _load_person_cache(video_path: str):
         cache_mtime = cache_path.stat().st_mtime
         video_mtime = Path(video_path).stat().st_mtime
         if video_mtime > cache_mtime:
-            print("  Person cache stale (video updated) — re-scanning")
+            log("  A face/person scan is cached for this clip, but the "
+                "video changed since — re-scanning instead of using it")
             return None
         with open(cache_path, "r") as f:
             data = json.load(f)
-        print(f"  Using cached person data ({len(data)} frames)")
+        log(f"  Reusing an already-done face/person scan for this clip "
+            f"({len(data)} frames) — skipping re-scanning")
         return data
     except Exception:
         return None
@@ -224,7 +228,7 @@ def _resolve_cut_flags(corr_values: list[float], cut_strong: float = 0.35,
     return flags
 
 
-def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
+def analyze_persons(video_path: str, progress_callback=None, log_label=None) -> list[dict]:
     """Scan video for faces (frontal+profile) and persons every ~1 second.
 
     Reads frames SEQUENTIALLY (no frame-index seeking — unreliable on some
@@ -235,7 +239,14 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
     then runs continuously until face reappears).
 
     Returns list of ``{frame_idx, x, y, w, h, num_faces, num_persons, type}`` dicts.
+
+    log_label: this always runs inside apply_vertical_crop()'s own timeout
+        sub-thread (see below) — a new OS thread that does not inherit the
+        parent thread's clip label — so the caller passes it through
+        explicitly and it's re-applied here for this thread's log() calls.
     """
+    set_clip_label(log_label)
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {video_path}")
@@ -246,8 +257,9 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
     interval = max(1, int(fps))
 
     if total <= 0:
-        print(f"  ⚠ OpenCV cannot decode video (total_frames={total}) — "
-              "skipping person tracking")
+        log(f"  ⚠ Couldn't read this video's frames (OpenCV reported "
+            f"{total} total) — skipping face/person tracking, will use a "
+            "plain center crop instead")
         cap.release()
         return []
 
@@ -455,8 +467,9 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
         elapsed = time_module.time() - _start
         if done % 10 == 0 or pct - last_print >= 0.05:
             eta = (elapsed / max(pct, 0.01) - elapsed) if pct > 0 else 0
-            print(f"  Person scan: {pct:.0%}  ({done}/{analyzed_count} frames, "
-                  f"{elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
+            log(f"  Looking for faces/people to track: {pct:.0%}  "
+                f"({done}/{analyzed_count} sampled frames checked, "
+                f"{elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
             last_print = pct
 
         if progress_callback:
@@ -467,8 +480,8 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
     cap.release()
     _elapsed = time_module.time() - _start
     found = sum(1 for f in person_data if f["x"] is not None)
-    print(f"  Person scan complete in {_elapsed:.0f}s, "
-          f"found {found}/{len(person_data)} frames with faces/persons")
+    log(f"  Done checking for faces/people in {_elapsed:.0f}s — "
+        f"found someone in {found}/{len(person_data)} sampled frames")
 
     # Resolve cut flags with hysteresis (v1-7 #3b anti-jitter debounce):
     # strong cuts instant, candidates need one-sample confirmation against
@@ -919,13 +932,19 @@ def apply_vertical_crop(
     if person_data is None:
         from concurrent.futures import ThreadPoolExecutor
         pool = ThreadPoolExecutor(max_workers=1)
-        fut = pool.submit(analyze_persons, video_path)
+        # analyze_persons() runs in a brand-new OS thread, which does NOT
+        # inherit this thread's clip label — pass it through explicitly so
+        # its progress lines still show which clip they belong to.
+        fut = pool.submit(analyze_persons, video_path, log_label=get_clip_label())
         scan_timeout = getattr(config, "PERSON_SCAN_TIMEOUT_SECONDS", 30)
         try:
             person_data = fut.result(timeout=scan_timeout)
             pool.shutdown(wait=False)
         except _CFTimeoutError:
-            print(f"  ⚠ Person scan timed out ({scan_timeout}s) — using fallback")
+            log(f"  ⚠ Face/person scan took longer than {scan_timeout}s — "
+                "giving up on it and using a plain center crop for this "
+                "clip instead (the scan keeps running in the background "
+                "but its result won't be used)")
             pool.shutdown(wait=False)
             return _center_crop_ffmpeg(video_path, output_path, progress_callback,
                                        anti_copyright=anti_copyright,
@@ -956,15 +975,15 @@ def apply_vertical_crop(
     faces_found = len(valid)
     total_frames = len(person_data)
     if faces_found > 0:
-        avg_cx = float(np.mean([fd["x"] + fd["w"] / 2 for fd in valid]))
-        avg_cy = float(np.mean([fd["y"] + fd["h"] / 2 for fd in valid]))
         types = [fd.get("type", "face") for fd in valid]
         face_count = types.count("face")
         person_count = types.count("person")
-        print(f"  Detected {faces_found}/{total_frames} frames "
-              f"({face_count} face, {person_count} person, avg center: {avg_cx:.0f}, {avg_cy:.0f})")
+        log(f"  Found someone in {faces_found}/{total_frames} sampled "
+            f"frames ({face_count} by face, {person_count} by body only) "
+            "— will crop to follow them")
     else:
-        print(f"  No faces/persons detected in {total_frames} frames")
+        log(f"  No faces or people found in any of the {total_frames} "
+            "sampled frames — falling back to a plain center crop")
 
     if progress_callback:
         progress_callback(0.6)
@@ -974,7 +993,8 @@ def apply_vertical_crop(
 
     # Decide: person-tracking crop or center crop
     if faces_found > 0 and fps > 0:
-        print(f"  Applying person-tracking crop ({faces_found} frames)...")
+        log(f"  Cropping to keep the detected face/person centered "
+            f"(tracked in {faces_found} frame(s))...")
         video_width = _get_video_width(video_path)
         video_height = _get_video_height(video_path)
         if video_width > 0 and video_height > 0:
@@ -989,7 +1009,7 @@ def apply_vertical_crop(
             _center_crop_ffmpeg_fixed(video_path, output_path, target_w, content_h,
                                       ac_part, progress_callback, clip_duration)
     else:
-        print(f"  Using center crop (no person data)")
+        log("  Cropping to the center of the frame (nothing to track)...")
         _center_crop_ffmpeg_fixed(video_path, output_path, target_w, content_h,
                                   ac_part, progress_callback, clip_duration)
 

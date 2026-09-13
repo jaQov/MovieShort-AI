@@ -33,8 +33,6 @@ DEFAULT_CONFIG = {
     "subtitle_italic": False,
     "subtitle_shadow": False,
     "subtitle_position_y": 400,
-    # Cost tracking (rub per minute of film with DeepSeek V4 Flash)
-    "cost_per_minute": 0.0,
 }
 
 

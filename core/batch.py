@@ -38,8 +38,12 @@ def _resolve_movie_title(settings, video_path):
     renamed files leak garbage into the LLM prompt)."""
     raw = (settings.get("movie_title") or "").strip()
     title = raw or Path(video_path).stem
-    if not raw:
-        print(f"⚠ Exact movie title not set — using filename «{title}» for analysis. Set a title for better results.")
+    if raw:
+        print(f"Movie title: «{title}» (used for AI context and output filenames)")
+    else:
+        print(f"⚠ No movie title was entered — using the filename «{title}» "
+              "instead, which may confuse the AI if it's full of release-group "
+              "junk (resolution, codec, etc). Enter a title for better results.")
     return title
 
 
@@ -84,7 +88,9 @@ def process_movie(video_path, settings=None):
     os.makedirs(movie_output, exist_ok=True)
 
     print(f"Processing movie: {os.path.basename(video_path)}")
-    print(f"Options: subtitles={subtitles}, face_tracking={face_tracking}")
+    print(f"Settings: subtitles burned in = {subtitles}, "
+          f"smart face/person centering = {face_tracking}, "
+          f"clip length = {min_duration}-{max_duration}s")
     print()
 
     subtitle_path = find_external_subtitle(
@@ -92,7 +98,8 @@ def process_movie(video_path, settings=None):
         explicit_path=settings.get("subtitle_path"),
     )
     if not subtitle_path:
-        print("❌ Missing subtitles: no subtitle file found.")
+        print("❌ Missing subtitles: no matching subtitle file was found "
+              "next to the video, and none was uploaded.")
         print("   Supported formats: .srt, .ass, .ssa, .vtt")
         print("Stopping.")
         return []
@@ -100,10 +107,9 @@ def process_movie(video_path, settings=None):
 
     # Step 1: Find best clips
     print("=" * 50)
-    print("STEP 1: Finding best scenes...")
+    print("STEP 1: Picking the best moments from the movie")
     print("=" * 50)
 
-    print("  Mode: context (local Ollama model sees scene text, picks by number)")
     best_scenes = find_best_clips_context(
         video_path, movie_title,
         max_duration, min_duration,
@@ -112,23 +118,21 @@ def process_movie(video_path, settings=None):
         subtitle_path=subtitle_path,
     )
     if best_scenes is None:
-        print("❌ Subtitle-based AI analysis failed.")
-        print("Stopping.")
+        print("❌ The AI scene analysis didn't produce a result — see the "
+              "errors above for why. Stopping.")
         return []
 
-    if movie_title:
-        print(f"  Movie: {movie_title}")
-
     if not best_scenes:
-        print("No suitable scenes found.")
+        print("No suitable moments were found in this movie.")
         return []
 
     print()
     print("=" * 50)
-    print(f"STEP 2: Processing {len(best_scenes)} clips...")
+    print(f"STEP 2: Rendering {len(best_scenes)} clip(s) to vertical video")
     print("=" * 50)
 
-    # Find the external-subtitle transcript JSON generated during analysis.
+    # Step 1 already parsed the subtitles into this cache file — reuse it
+    # instead of re-parsing, and to feed filter_segments_in_range() per clip.
     import hashlib
     transcript_json = None
     video_basename = get_video_basename(video_path)
@@ -141,10 +145,11 @@ def process_movie(video_path, settings=None):
     expected = str(config.CACHE_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
     if os.path.exists(expected):
         transcript_json = expected
-        print(f"Found subtitle transcript: full_transcript_{video_basename}_{file_hash}.json")
 
     if not transcript_json:
-        print("❌ Missing subtitles: the external subtitle transcript cache was not created.")
+        print("❌ Missing subtitles: Step 1's parsed-subtitle cache is "
+              "gone or couldn't be written — can't burn in captions "
+              "without it.")
         print("Stopping.")
         return []
 
@@ -175,8 +180,10 @@ def process_movie(video_path, settings=None):
                 orig_end_fmt = _format_time(scene_end)
                 scene_start, scene_end = new_start, new_end
                 scene_dur = scene_end - scene_start
-                print(f"  🎯 Scene {orig_start_fmt}-{orig_end_fmt} ({scene_dur:.0f}s): "
-                      f"centered on dialogue → {_format_time(scene_start)}-{_format_time(scene_end)}")
+                print(f"  🎯 The AI's pick ({orig_start_fmt}-{orig_end_fmt}, "
+                      f"{scene_dur:.0f}s) was longer than the {max_duration}s "
+                      "max, so trimmed it to the densest dialogue window: "
+                      f"{_format_time(scene_start)}-{_format_time(scene_end)}")
 
         timestamps.append((_format_time(scene_start), _format_time(scene_end)))
         titles.append(title)
@@ -217,27 +224,9 @@ def process_movie(video_path, settings=None):
     # Summary
     done = sum(1 for r in results if r is not None)
     print(f"\n{'=' * 50}")
-    print(f"Complete: {done}/{len(best_scenes)} clips ready")
-    print(f"Output: {movie_output}")
-
-    # Cost estimate (load from user config)
-    try:
-        from utils import user_config as _uc
-        _cfg = _uc.load()
-        cpm = _cfg.get("cost_per_minute", 0.0)
-        if cpm > 0:
-            import subprocess as _sp
-            dur_str = _sp.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", video_path],
-                capture_output=True, text=True, timeout=30
-            ).stdout.strip()
-            dur_min = float(dur_str) / 60 if dur_str else 0
-            est_cost = dur_min * cpm
-            print(f"💰 Cost: ~{est_cost:.2f} ({cpm:.2f}/min × {dur_min:.1f} min)")
-    except Exception:
-        pass
-
+    print(f"Complete: {done}/{len(best_scenes)} clip(s) ready "
+          "(processed 100% locally — no API cost)")
+    print(f"Output folder: {movie_output}")
     print(f"{'=' * 50}")
 
     # Print output list
@@ -246,7 +235,8 @@ def process_movie(video_path, settings=None):
             fname = os.path.basename(r)
             print(f"  ✅ {fname}")
         else:
-            print(f"  ❌ clip {i+1} — failed")
+            clip_title = titles[i] if i < len(titles) and titles[i] else f"clip {i+1}"
+            print(f"  ❌ «{clip_title}» — failed, see its errors above")
 
     # Auto-cleanup: delete temp files if enabled.
     # CACHE_DIR survives auto_cleanup by design (reusable transcripts/person/RMS caches).
@@ -351,6 +341,10 @@ def _validate_sub_clips(sub_clips, block_start, block_end, block_duration,
     4. Score 1-10
     5. No negative start or overflow
 
+    Reports every applicable reason for a rejection in one line — this is
+    the only place a rejection gets printed; don't re-log the same
+    candidates elsewhere or they'll show up twice with different wording.
+
     Returns filtered list with logged drops.
     """
     valid = []
@@ -361,17 +355,23 @@ def _validate_sub_clips(sub_clips, block_start, block_end, block_duration,
         sc_score = sc.get("score", 5)
         sc_title = sc.get("title", "") or "untitled"
 
+        reasons = []
         if sc_start < 0 or sc_end > block_end:
-            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — outside block bounds")
-            continue
+            reasons.append(
+                "its timestamps fall outside the section the AI was "
+                "given for this block (it likely mixed up which part "
+                "of the movie it was looking at)"
+            )
         if sc_dur < min_duration:
-            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — too short ({sc_dur:.0f}s)")
-            continue
+            reasons.append(f"{sc_dur:.0f}s is shorter than the {min_duration}s minimum")
         if sc_dur > max_duration:
-            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — too long ({sc_dur:.0f}s)")
-            continue
+            reasons.append(f"{sc_dur:.0f}s is longer than the {max_duration}s maximum")
         if sc_score < 1 or sc_score > 10:
-            print(f"  ⛔ «{sc_title}» — invalid score {sc_score}")
+            reasons.append(f"its score ({sc_score}) isn't a valid 1-10 rating")
+
+        if reasons:
+            print(f"  ⛔ «{sc_title}» ({sc_start:.0f}-{sc_end:.0f}s) skipped: "
+                  + "; ".join(reasons))
             continue
 
         valid.append({
@@ -574,45 +574,52 @@ def find_best_clips_context(video_path, movie_title,
 
     video_basename = Path(video_path).stem
     total_start = time.time()
-    print(f"\n🎬 {video_basename}: Context mode — block-based LLM pipeline")
+    print(f"\n🎬 Analyzing \"{video_basename}\" to find the best {min_duration}-"
+          f"{max_duration}s clips...")
 
     # Step 1: Detect scenes and map the external subtitle file to them.
-    print("[Context] Detecting scenes and loading subtitles...")
+    print("  Detecting visual scene changes and matching them to the "
+          "subtitle file's dialogue...")
     blocks = detect_and_transcribe(
         video_path,
         subtitle_path=subtitle_path,
     )
 
     if not blocks:
-        print("  No subtitle-based blocks detected")
+        # Should not normally happen — detect_and_transcribe() already
+        # raises if subtitles are missing/unusable, or falls back to a
+        # single whole-movie block if scene detection finds nothing.
+        print("  No usable scenes/subtitles came back — can't continue.")
         return None
 
     total_duration = blocks[-1]["end"] if blocks else 0
-    print(f"  Movie duration: {_format_time(total_duration)} ({total_duration:.0f}s)")
-    print(f"  {len(blocks)} blocks with transcription")
+    print(f"  Movie is {_format_time(total_duration)} long ({total_duration:.0f}s), "
+          f"split into {len(blocks)} scene(s) with matching dialogue")
 
     # Step 1.5: Merge small blocks into super-blocks for LLM to work with.
     # Blocks must be comfortably larger than the requested max clip length —
     # a clip can never be selected past its own block's end (see
-    # _validate_sub_clips's "outside block bounds" check) — so a fixed
-    # 120-150s super-block silently capped every clip at ~75s regardless of
-    # the max_duration the user asked for.
+    # _validate_sub_clips's bounds check) — so a fixed 120-150s super-block
+    # silently capped every clip at ~75s regardless of the max_duration the
+    # user asked for.
     before_merge = len(blocks)
     super_target = max(120, max_duration + 40)
     super_cap = super_target + 30
     blocks = _merge_blocks_for_llm(blocks, target_duration=super_target, max_duration=super_cap)
-    print(f"  Merged {before_merge} → {len(blocks)} super-blocks "
-          f"(target {super_target}s, range {super_target - 30}-{super_cap}s)")
+    print(f"  Grouped those {before_merge} scenes into {len(blocks)} bigger "
+          f"sections (~{super_target}s each, so there's enough dialogue in "
+          f"each one for the AI to judge) to send to the AI for scoring")
 
     # Step 1.6: Filter out silent / credits / music blocks
     before_filter = len(blocks)
     blocks = [b for b in blocks if not _is_credit_or_silent(b)]
     filtered = before_filter - len(blocks)
     if filtered:
-        print(f"  Filtered out {filtered} credit/silent block(s)")
+        print(f"  Skipped {filtered} section(s) with little/no dialogue "
+              "(likely credits, silence, or background music)")
 
     if not blocks:
-        print("  No blocks with dialogue — nothing to process")
+        print("  Nothing left with actual dialogue in it — nothing to process.")
         return None
 
     model = config.OLLAMA_MODEL
@@ -624,8 +631,12 @@ def find_best_clips_context(video_path, movie_title,
     total_batches = len(batches)
 
     # Step 2: Process blocks in batches through LLM
-    print(f"[Context] Processing {len(blocks)} blocks in batches of {batch_size} "
-          f"(model: {model}, ~{total_batches} LLM calls)...")
+    print(f"  Asking the local AI model ({model}) to pick clips from "
+          f"{len(blocks)} section(s), {batch_size} at a time "
+          f"(~{total_batches} request(s) total)...")
+    print("  Per section below: \"Cuts\" = how many camera/scene changes "
+          "happen inside it (higher = more action); \"Pauses\" = natural "
+          "gaps in the dialogue the AI can use as a clip's start/end point.")
     batch_start = 0
     for batch_num, batch_blocks in enumerate(batches, 1):
         print(f"\n  ── Batch {batch_num}/{total_batches} "
@@ -679,7 +690,8 @@ def find_best_clips_context(video_path, movie_title,
         try:
             raw_response = call_llm(prompt, max_tokens=_max_tokens_for(len(batch_blocks)))
         except Exception as e:
-            print(f"  ⚠️ Batch {batch_num} LLM failed: {e}")
+            print(f"  ⚠️ Batch {batch_num}: the local AI didn't respond ({e}) "
+                  "— will retry this batch's sections one at a time below")
 
         # Parse batch response into per-block clip lists
         if raw_response:
@@ -693,12 +705,16 @@ def find_best_clips_context(video_path, movie_title,
             raw_short = raw_response.strip()
             if len(raw_short) > 500:
                 raw_short = raw_short[:500] + "..."
-            print(f"  ⚠️ Batch {batch_num}: LLM returned 0 parsed clips. Raw (truncated):")
+            print(f"  ⚠️ Batch {batch_num}: got a response but couldn't make "
+                  "sense of it as clip data. What the AI actually said "
+                  "(truncated):")
             print(f"     {raw_short}")
 
         # T4: split-retry when null/0-parsed and batch size > 1
         if (raw_response is None or not batch_clips) and len(batch_blocks) > 1:
-            print(f"  ↻ Batch {batch_num}: null/0-parsed → split-retry ({len(batch_blocks)} blocks)")
+            print(f"  ↻ Batch {batch_num}: no usable answer for all "
+                  f"{len(batch_blocks)} sections together — asking about "
+                  "each one separately instead")
             from collections import deque as _dq
             merged: dict[int, list[dict]] = {}
             mid0 = len(batch_blocks) // 2
@@ -731,7 +747,8 @@ def find_best_clips_context(video_path, movie_title,
                 try:
                     sub_raw = call_llm(sub_prompt, max_tokens=_max_tokens_for(len(sub_blocks)))
                 except Exception as e:
-                    print(f"  ⚠️ Split sub-batch (offset {offset}, size {len(sub_blocks)}) failed: {e}")
+                    print(f"  ⚠️ Retry for section(s) {offset+1}-{offset+len(sub_blocks)}: "
+                          f"still no response ({e})")
                     sub_raw = None
                 if sub_raw:
                     sub_starts = [b["start"] for b in sub_blocks]
@@ -742,15 +759,21 @@ def find_best_clips_context(video_path, movie_title,
                     sm = len(sub_blocks) // 2
                     queue.append((sub_blocks[:sm], offset))
                     queue.append((sub_blocks[sm:], offset + sm))
-                    print(f"  ↻ Split sub-batch offset {offset} size {len(sub_blocks)} still empty → split in 2")
+                    print(f"  ↻ Still no usable answer for section(s) "
+                          f"{offset+1}-{offset+len(sub_blocks)} — splitting "
+                          "further and retrying")
                 elif sub_clips:
                     for k, v in sub_clips.items():
                         merged.setdefault(k + offset, []).extend(v)
             if merged:
                 batch_clips = merged
-                print(f"  ✅ Split-retry recovered {sum(len(v) for v in batch_clips.values())} clip(s) for batch {batch_num}")
+                print(f"  ✅ Recovered {sum(len(v) for v in batch_clips.values())} "
+                      f"clip(s) from batch {batch_num} by asking one section "
+                      "at a time")
             else:
-                print(f"  ⚠️ Split-retry: no clips recovered for batch {batch_num}, fallback will apply")
+                print(f"  ⚠️ Still nothing usable for batch {batch_num} even "
+                      "one section at a time — those blocks will fall back "
+                      "to automatic centering below")
 
         # Process each block in the batch
         for i, block in enumerate(batch_blocks):
@@ -763,44 +786,30 @@ def find_best_clips_context(video_path, movie_title,
             # Get clips for this block (absolute timestamps from batch parser)
             block_clips = batch_clips.get(i, [])
 
-            # Validate — batch clips have absolute timestamps, so pass block_start=0
+            # Validate — batch clips have absolute timestamps, so pass
+            # block_start=0. _validate_sub_clips() prints why anything gets
+            # rejected — don't duplicate that here.
             valid_clips = _validate_sub_clips(block_clips, 0, block_end, block_dur,
                                               min_duration, max_duration) if block_clips else []
             for vc in valid_clips:
                 vc["text"] = dialogue
 
-            # Debug logging when LLM returns 0 valid clips for this block
             if len(valid_clips) == 0:
-                if block_clips:
-                    # Parser found clips but validation rejected all
-                    for sc in block_clips:
-                        sc_start = sc.get("start", 0)
-                        sc_end = sc.get("end", block_end)
-                        sc_dur = sc_end - sc_start
-                        sc_score = sc.get("score", 5)
-                        sc_title = sc.get("title", "") or "untitled"
-                        reasons = []
-                        if sc_start < block_start or sc_end > block_end:
-                            reasons.append("out_of_bounds")
-                        if sc_dur < min_duration:
-                            reasons.append(f"too_short({sc_dur:.0f}s)")
-                        if sc_dur > max_duration:
-                            reasons.append(f"too_long({sc_dur:.0f}s)")
-                        if sc_score < 1 or sc_score > 10:
-                            reasons.append(f"bad_score({sc_score})")
-                        print(f"    ⛔ Rejected: «{sc_title}» {sc_start:.0f}-{sc_end:.0f}s "
-                              f"dur={sc_dur:.0f}s score={sc_score} reason={'/'.join(reasons)}")
-                else:
-                    print(f"  ℹ️ Block {global_idx+1}: no clips from LLM")
+                if not block_clips:
+                    print(f"  ℹ️ Section {global_idx+1}: the AI didn't "
+                          "suggest any clips for it")
             else:
-                print(f"  ✅ Block {global_idx+1}: {len(valid_clips)} valid clip(s)")
+                print(f"  ✅ Section {global_idx+1}: {len(valid_clips)} "
+                      "clip(s) accepted")
 
             # Fallback: if LLM returned nothing but block has dialogue, use smart centering
             if not valid_clips and dialogue:
                 segments = [{"start": block_start, "end": block_end, "text": dialogue}]
                 fb_start, fb_end = _find_best_window(segments, block_start, block_end, max_duration)
                 if fb_start is not None:
-                    print(f"    → Fallback: smart centering ({fb_start:.0f}-{fb_end:.0f})")
+                    print(f"    → No AI-picked clip survived for this "
+                          f"section, so picking the {fb_start:.0f}-{fb_end:.0f}s "
+                          "window with the most dialogue in it instead")
                     valid_clips.append({
                         "start": fb_start,
                         "end": fb_end,
@@ -814,7 +823,8 @@ def find_best_clips_context(video_path, movie_title,
 
         batch_start += len(batch_blocks)
     if not all_sub_clips:
-        print("  No valid clips from LLM results")
+        print("  Nothing survived — neither the AI nor the automatic "
+              "fallback produced any usable clip. Stopping.")
         return None
 
     # Step 3: Sort by start time
@@ -827,28 +837,41 @@ def find_best_clips_context(video_path, movie_title,
         # If nothing passes threshold, keep top N clips anyway
         all_sub_clips.sort(key=lambda x: x["score"], reverse=True)
         filtered = all_sub_clips[:max(1, num_clips // 4)]
-        print(f"  Score threshold ({score_threshold}): no clips qualify, keeping top {len(filtered)}")
+        print(f"  None of the {before} candidate clip(s) scored "
+              f"{score_threshold}/10 or higher — keeping the "
+              f"{len(filtered)} best-scored one(s) anyway rather than "
+              "producing nothing")
     else:
-        print(f"  Score threshold ({score_threshold}): {before} → {len(filtered)} clip(s)")
+        print(f"  Keeping clips scored {score_threshold}/10 or higher: "
+              f"{before} candidate(s) → {len(filtered)} kept")
 
-    # Step 5: Diversity filter
+    # Step 5: Diversity filter — spreads the kept clips across the whole
+    # movie instead of letting them clump in one part of it.
     before = len(filtered)
     filtered.sort(key=lambda x: x["score"], reverse=True)
     if total_duration > 0:
         filtered = _diversity_filter(filtered, num_clips, total_duration)
     else:
         filtered = filtered[:num_clips]
-    print(f"  Diversity filter: {before} → {len(filtered)} clip(s)")
+    print(f"  Spreading clips across the whole movie (top clip per "
+          f"timeline segment, capped at {num_clips}): {before} → "
+          f"{len(filtered)} clip(s)")
 
-    # Step 6: Deduplication
+    # Step 6: Deduplication — two clips starting within min_gap of each
+    # other are treated as the same moment; only the higher-scored one survives.
     before = len(filtered)
     filtered = _deduplicate_clips(filtered)
-    print(f"  Dedup: {before} → {len(filtered)} clip(s)")
+    print(f"  Removing clips that are basically the same moment (starting "
+          f"too close together): {before} → {len(filtered)} clip(s)")
 
-    # Step 7: Min duration expansion
-    before = len(filtered)
+    # Step 7: Min duration expansion — safety net for a fallback clip that
+    # ended up short (see _find_best_window); the AI-picked ones already
+    # can't be shorter than min_duration by this point (_validate_sub_clips).
+    short_before = [c for c in filtered if (c["end"] - c["start"]) < min_duration]
     filtered = _expand_short_clips(filtered, min_duration)
-    print(f"  Min duration expansion ({min_duration}s): {before} → {len(filtered)} clip(s)")
+    if short_before:
+        print(f"  Stretched {len(short_before)} clip(s) that came out "
+              f"under {min_duration}s up to exactly {min_duration}s")
 
     # Step 8: Sort by start and resolve overlaps
     filtered.sort(key=lambda x: x["start"])
@@ -863,10 +886,12 @@ def find_best_clips_context(video_path, movie_title,
             if curr["start"] < mid:
                 curr["start"] = mid
                 curr["duration"] = curr["end"] - curr["start"]
-            print(f"  Overlap resolved: cut at {_format_time(mid)}")
+            print(f"  Two selected clips overlapped in time — split them "
+                  f"at {_format_time(mid)} so they don't share any footage")
 
     elapsed = time.time() - total_start
-    print(f"\n✓ {len(filtered)} clip(s) selected in {elapsed:.0f}s")
+    print(f"\n✓ Picked {len(filtered)} final clip(s) in {elapsed:.0f}s "
+          f"({elapsed/60:.1f} min)")
     return filtered
 
 
@@ -936,10 +961,14 @@ def _deduplicate_clips(clips, min_gap=120.0):
         if gap < min_gap:
             if clip["score"] > kept[-1]["score"]:
                 removed = kept.pop()
-                print(f"🗑️ Clip «{removed.get('title','')}» removed (duplicate of {clip.get('title','')}, {gap:.0f}s apart)")
+                print(f"🗑️ «{removed.get('title','')}» dropped — only "
+                      f"{gap:.0f}s from «{clip.get('title','')}» (kept the "
+                      "higher-scored one)")
                 kept.append(clip)
             else:
-                print(f"🗑️ Clip «{clip.get('title','')}» removed (duplicate of {kept[-1].get('title','')}, {gap:.0f}s apart)")
+                print(f"🗑️ «{clip.get('title','')}» dropped — only "
+                      f"{gap:.0f}s from «{kept[-1].get('title','')}» (kept "
+                      "the higher-scored one)")
         else:
             kept.append(clip)
     return kept

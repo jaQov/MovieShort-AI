@@ -17,6 +17,8 @@ import json
 import re
 from pathlib import Path
 
+from utils.clip_log import log
+
 
 # ---------------------------------------------------------------------------
 # SRT / subtitle generation
@@ -192,9 +194,9 @@ def generate_word_group_srt(
     with open(output_path, "w", encoding="utf-8-sig") as f:
         f.write("\n".join(lines))
 
-    print(
-        f"Word-group SRT saved: "
-        f"{output_path} ({index} entries)"
+    log(
+        f"      Wrote this clip's subtitle file "
+        f"({index} caption(s)): {Path(output_path).name}"
     )
 
     return index

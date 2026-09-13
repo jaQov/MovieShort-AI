@@ -1368,7 +1368,6 @@ def create_app() -> gr.Blocks:
         pass
     # Load persisted settings
     cfg = user_config.load()
-    cfg["cost_per_minute"] = 0.13
     ui_lang = "en"
 
     with gr.Blocks(

@@ -61,15 +61,17 @@ def detect_scenes(video_path, threshold=None):
     print("=" * 50)
     print("SCENE DETECTION")
     print("=" * 50)
+    print("Finding where the camera cuts to a new shot, so later steps "
+          "know where one 'scene' ends and the next begins.")
 
     print(
         f"Detector: ContentDetector "
-        f"(threshold={threshold})"
+        f"(threshold={threshold} — lower catches more/smaller cuts)"
     )
 
     print(
         f"Frame skip: {frame_skip} "
-        f"(processes every {frame_skip + 1}th frame)"
+        f"(checks every {frame_skip + 1}th frame, to go faster)"
     )
 
     print()
@@ -93,12 +95,6 @@ def detect_scenes(video_path, threshold=None):
         total_frames_est // (frame_skip + 1),
     )
 
-    # Rough estimate for progress display.
-    est_sec = max(
-        1,
-        frames_to_process / 2000,
-    )
-
     print(
         f"Video: {total_frames_est} frames "
         f"@ {fps:.2f} fps"
@@ -110,9 +106,9 @@ def detect_scenes(video_path, threshold=None):
     )
 
     print(
-        f"Will process: ~{frames_to_process} frames "
-        f"(est. {est_sec:.0f}s / "
-        f"{est_sec / 60:.1f}min)"
+        f"Will check ~{frames_to_process} frames for cuts. This step reads "
+        "through the whole video, so it typically takes several minutes on "
+        "a long movie — a live ETA will appear below once scanning starts."
     )
 
     print()
@@ -270,7 +266,7 @@ def detect_scenes(video_path, threshold=None):
         )
 
     print(
-        f"  Found {len(scenes)} scenes"
+        f"  Found {len(scenes)} camera cuts"
     )
 
     return scenes
@@ -358,8 +354,9 @@ def merge_short_scenes(
         merged.append(buffer)
 
     print(
-        f"  After merging short scenes: "
-        f"{len(merged)} scenes"
+        f"  Merged cuts shorter than {min_duration:.0f}s into their "
+        f"neighbors (too short to be their own scene): {len(merged)} "
+        "scene(s) left"
     )
 
     return merged
@@ -515,8 +512,8 @@ def detect_and_transcribe(
     # ------------------------------------------------------------------
     if not merged:
         print(
-            "  No scenes detected, "
-            "treating whole video as one scene"
+            "  No camera cuts were detected at all (unusual) — "
+            "treating the entire video as one single scene"
         )
 
         try:
@@ -680,9 +677,9 @@ def detect_and_transcribe(
             index + 1
         ) % 20 == 0:
             print(
-                "  Mapped subtitles to "
+                "  Matched dialogue to "
                 f"{index + 1}/"
-                f"{len(merged)} scenes"
+                f"{len(merged)} scenes so far"
             )
 
     # ------------------------------------------------------------------
@@ -727,20 +724,20 @@ def detect_and_transcribe(
         )
 
         print(
-            "  Subtitle transcript cache: "
-            f"{cache_path.name}"
+            "  Saved the parsed subtitles for reuse when rendering the "
+            f"final clips: {cache_path.name}"
         )
 
     except Exception as error:
         # Cache failure should not destroy an otherwise valid analysis.
         print(
-            "  ⚠ Could not save subtitle cache: "
-            f"{error}"
+            "  ⚠ Couldn't save the parsed-subtitle cache (analysis will "
+            f"still continue, but it'll have to be re-parsed later): {error}"
         )
 
     print(
-        f"  ✓ {len(results)} scenes "
-        "mapped to subtitles"
+        f"  ✓ Matched dialogue to all {len(results)} scenes — ready for "
+        "the AI to pick the best ones"
     )
 
     return results

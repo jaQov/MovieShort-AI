@@ -179,7 +179,7 @@ def test_resolve_movie_title_empty_warns_with_stem(capsys):
     title = _resolve_movie_title({"movie_title": ""}, "D:/Movies/Inception.2010.1080p.mkv")
     assert title == "Inception.2010.1080p"
     out = capsys.readouterr().out
-    assert "Exact movie title not set" in out
+    assert "No movie title was entered" in out
     assert "Inception.2010.1080p" in out
 
 
@@ -188,7 +188,7 @@ def test_resolve_movie_title_missing_key_warns(capsys):
     title = _resolve_movie_title({}, "D:/Movies/SomeFilm.mp4")
     assert title == "SomeFilm"
     out = capsys.readouterr().out
-    assert "Exact movie title not set" in out
+    assert "No movie title was entered" in out
     assert "SomeFilm" in out
 
 
@@ -196,7 +196,7 @@ def test_resolve_movie_title_given_no_warning(capsys):
     """Non-empty movie_title → returned as-is, no warning."""
     title = _resolve_movie_title({"movie_title": "Inception"}, "D:/Movies/Inception.mkv")
     assert title == "Inception"
-    assert "Exact movie title not set" not in capsys.readouterr().out
+    assert "No movie title was entered" not in capsys.readouterr().out
 
 
 # --- T5: batch sizing + prompt budget guard ---

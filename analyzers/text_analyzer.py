@@ -19,7 +19,8 @@ def call_llm(prompt_text: str, max_tokens: int = 256) -> str:
     base = getattr(config, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     model = getattr(config, "OLLAMA_MODEL", "qwen3:8b")
 
-    print(f"  Local Ollama model: {model}")
+    # Not printed here — this runs once per LLM call (dozens per movie);
+    # the active model is announced once by find_best_clips_context() instead.
 
     url = f"{base}/api/chat"
 

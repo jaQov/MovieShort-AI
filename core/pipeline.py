@@ -26,6 +26,7 @@ from core.subtitle import (
 )
 from core.processor import apply_vertical_crop
 from utils.font_manager import FONTS_DIR, ensure_font
+from utils.clip_log import log, set_clip_label, clear_clip_label
 
 
 def _resolve_font_style(options):
@@ -146,7 +147,7 @@ def _time_to_seconds(hh_mm_ss: str) -> float:
     return float(parts[0])
 
 
-def process_clip(video_path, start_time, end_time, options=None, title=""):
+def process_clip(video_path, start_time, end_time, options=None, title="", log_label=None):
     """
     Process a single clip: cut → subtitle → scale → embed subtitles → pad → export.
 
@@ -166,12 +167,20 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
             - transcript_path (str): path to parsed external-subtitle JSON
             - movie_title (str): movie name used in the output filename
         title: optional short clip title to include in output filename
+        log_label: prefix (e.g. "Clip 2/4 · Hacking the system") stamped on
+            every log line this call produces, including from functions it
+            calls (apply_vertical_crop, ffmpeg steps). process_multiple()
+            renders clips in parallel worker threads with no other way to
+            tell whose output is whose in the interleaved console — see
+            utils/clip_log.py.
 
     Returns:
         Path to the final output file, or None on failure.
     """
     if options is None:
         options = {}
+
+    set_clip_label(log_label)
 
     subtitles_enabled = options.get("subtitles", True)
     face_tracking_enabled = options.get("face_tracking", True)
@@ -200,7 +209,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
 
     try:
         # Step 1: Cut the segment
-        print(f"[1/5] Cutting {start_time} - {end_time}...")
+        log(f"[1/5] Cutting the {start_time}–{end_time} segment out of the source video...")
         clip_video(video_path, start_time, end_time, raw_clip, gpu_opts=gpu_opts)
 
         # Step 2: Generate subtitles from the external-subtitle transcript.
@@ -217,7 +226,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                     "was provided for this clip."
                 )
 
-            print("[2/5] Generating subtitles from external subtitle transcript...")
+            log("[2/5] Slicing this clip's lines out of the movie's subtitle file...")
 
             start_sec = _time_to_seconds(start_time)
             end_sec = _time_to_seconds(end_time)
@@ -236,13 +245,12 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                     "subtitle cues."
                 )
 
+            log(f"      Found {len(clip_segments)} subtitle line(s) in "
+                "this time range")
+
             sub_path = _write_subtitles(
                 clip_segments,
                 str(config.TEMP_DIR / clip_name),
-            )
-
-            print(
-                f"      {len(clip_segments)} subtitle segments → word-group SRT"
             )
 
             # External subtitles are already attached to the source timeline,
@@ -258,7 +266,8 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
 
         # Step 3: Scale to fit content area (1080 × content_h, preserves aspect ratio)
         if face_tracking_enabled:
-            print("[3/5] Scaling to Shorts format...")
+            log("[3/5] Converting to vertical 9:16 — looking for faces/people to "
+                "keep them centered in frame...")
             apply_vertical_crop(
                 clip_with_audio,
                 vertical_clip,
@@ -267,7 +276,8 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 banner_bottom=banner_bottom,
             )
         else:
-            print("[3/5] Scaling to Shorts format...")
+            log("[3/5] Converting to vertical 9:16 (plain center crop — "
+                "smart centering is off)...")
             convert_to_vertical(
                 clip_with_audio,
                 vertical_clip,
@@ -279,7 +289,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
 
         # Step 4: Embed subtitles (on content-area video, before banner padding)
         if os.path.exists(sub_path) and os.path.getsize(sub_path) > 0:
-            print("[4/5] Embedding subtitles...")
+            log("[4/5] Burning the subtitles into the video...")
             subtitled_clip = str(config.TEMP_DIR / f"{clip_name}_subs.mp4")
             embed_subtitles(
                 vertical_clip,
@@ -301,7 +311,8 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
         # backdrop never contains a blurred "ghost" of the subtitles — only
         # the sharp foreground (subtitled_clip) shows them.
         if blur_enabled:
-            print("[5/5] Adding blurred background...")
+            log("[5/5] Filling the top/bottom bars with a blurred copy of the "
+                "video and exporting the final file...")
             blur_background(
                 subtitled_clip,
                 final_output,
@@ -312,7 +323,8 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 background_source=vertical_clip,
             )
         else:
-            print("[5/5] Padding to full frame (no blur)...")
+            log("[5/5] Padding the top/bottom bars with plain black and "
+                "exporting the final file (blur is off)...")
             # If blur disabled, pad the content-area video to full 9:16
             pad_with_banners(
                 subtitled_clip,
@@ -322,20 +334,20 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 gpu_opts=gpu_opts,
             )
 
-        print(f"Done! → {final_output}")
+        log(f"✅ Done → {os.path.basename(final_output)}")
         return final_output
 
     except FFmpegError as e:
-        print(f"FFmpeg error: {e}")
+        log(f"❌ FFmpeg failed while rendering this clip: {e}")
         return None
     except RuntimeError as e:
-        print(f"❌ {e}")
+        log(f"❌ {e}")
         return None
     except subprocess.TimeoutExpired:
-        print("Processing timed out")
+        log("❌ Rendering this clip took too long and was aborted (timeout).")
         return None
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        log(f"❌ Unexpected error while rendering this clip: {e}")
         return None
     finally:
         # Cleanup temp files
@@ -348,6 +360,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                     os.remove(f)
                 except OSError:
                     pass
+        clear_clip_label()
 
 
 def process_multiple(video_path, timestamps_list, options=None, titles=None, max_workers=2):
@@ -373,19 +386,30 @@ def process_multiple(video_path, timestamps_list, options=None, titles=None, max
     if titles is None:
         titles = [""] * total
 
+    def _label_for(i):
+        """'Clip 2/4 · Hacking the system' — stamped on every line that
+        clip's processing produces (see process_clip's log_label)."""
+        base = f"Clip {i + 1}/{total}"
+        return f"{base} · {titles[i]}" if titles[i] else base
+
     if max_workers <= 1:
         # Sequential mode
         results = []
         for i, (start, end) in enumerate(timestamps_list):
-            print(f"\n--- Clip {i+1}/{total}: {start} - {end} ---")
-            result = process_clip(video_path, start, end, options, title=titles[i])
+            print(f"\n--- {_label_for(i)}: {start} - {end} ---")
+            result = process_clip(video_path, start, end, options,
+                                   title=titles[i], log_label=_label_for(i))
             results.append(result)
         done = sum(1 for r in results if r is not None)
-        print(f"\nDone: {done}/{total} clips processed")
+        print(f"\nDone: {done}/{total} clip(s) processed successfully")
         return results
 
-    # Parallel mode
-    print(f"\nProcessing {total} clips with max_workers={max_workers}...")
+    # Parallel mode. Rendering is CPU/GPU-bound (ffmpeg, face detection) —
+    # max_workers clips are in flight at once, so their console output
+    # interleaves. Every line from a clip's processing is prefixed with its
+    # "Clip N/total · title" label (see utils/clip_log.py) precisely so this
+    # interleaving stays readable.
+    print(f"\nRendering {total} clip(s), {max_workers} at a time...")
     results = [None] * total
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -398,6 +422,7 @@ def process_multiple(video_path, timestamps_list, options=None, titles=None, max
                 end,
                 options,
                 title=titles[i],
+                log_label=_label_for(i),
             )
             future_to_idx[future] = i
 
@@ -406,12 +431,12 @@ def process_multiple(video_path, timestamps_list, options=None, titles=None, max
             try:
                 result = future.result()
                 results[idx] = result
-                status = "✅" if result else "❌"
-                print(f"  Clip {idx+1}/{total} {status}")
+                status = "finished ✅" if result else "failed ❌"
+                print(f"  {_label_for(idx)}: {status}")
             except Exception as e:
-                print(f"  Clip {idx+1}/{total} ❌ failed: {e}")
+                print(f"  {_label_for(idx)}: failed ❌ — {e}")
                 results[idx] = None
 
     done = sum(1 for r in results if r is not None)
-    print(f"\nDone: {done}/{total} clips processed (parallel)")
+    print(f"\nDone: {done}/{total} clip(s) processed successfully")
     return results
