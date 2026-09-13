@@ -1,4 +1,4 @@
-"""T4 — Yandex null/0-parsed split-retry и адаптивный max_tokens."""
+"""T4 — null/0-parsed split-retry and adaptive max_tokens."""
 import json
 import pytest
 import core.batch as cb
@@ -52,7 +52,7 @@ def test_split_retry_on_null_batch(monkeypatch):
         {"start": 185, "end": 215, "title": "Clip3", "score": 7.0, "reason": "x", "block": 1},
     ])
     seq = [None, half1_json, half2_json]
-    def fake_call(prompt, api_key, provider, max_tokens=4096):
+    def fake_call(prompt, max_tokens=4096):
         calls.append(max_tokens)
         return seq[min(len(calls)-1, len(seq)-1)]
     monkeypatch.setattr(cb, "call_llm", fake_call)
@@ -62,7 +62,7 @@ def test_split_retry_on_null_batch(monkeypatch):
 
     # need to avoid diversity/dedup messing — patch to identity where possible but keep behavior
     # Use small num_clips large enough
-    result = cb.find_best_clips_context("fake.mp4", "TestFilm", api_key="k", provider="yandex", max_duration=60, min_duration=15, num_clips=10, score_threshold=7.0, language="ru")
+    result = cb.find_best_clips_context("fake.mp4", "TestFilm", max_duration=60, min_duration=15, num_clips=10, score_threshold=7.0)
     # Should have recovered 4 clips via split-retry, before threshold filtering
     assert result is not None
     assert len(result) == 4
@@ -86,14 +86,14 @@ def test_single_block_null_no_loop(monkeypatch):
     monkeypatch.setattr(cb, "_find_best_window", lambda segs, s, e, md: (s+5, s+35))
 
     calls = []
-    def fake_call_null(prompt, api_key, provider, max_tokens=4096):
+    def fake_call_null(prompt, max_tokens=4096):
         calls.append(max_tokens)
         return None
     monkeypatch.setattr(cb, "call_llm", fake_call_null)
     import analyzers.text_analyzer as ta
     monkeypatch.setattr(ta, "call_llm", fake_call_null)
 
-    result = cb.find_best_clips_context("fake.mp4", "SingleFilm", api_key="k", provider="yandex", max_duration=60, min_duration=15, num_clips=10, score_threshold=7.0, language="ru")
+    result = cb.find_best_clips_context("fake.mp4", "SingleFilm", max_duration=60, min_duration=15, num_clips=10, score_threshold=7.0)
     # single block should not loop; fallback creates 1 clip with score 5.0
     assert len(calls) == 1
     assert calls[0] == 4096  # max(4096, min(8192, 4096*1//2+2048))=4096

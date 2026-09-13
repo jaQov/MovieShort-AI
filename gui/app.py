@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time as time_module
+from pathlib import Path
 from typing import List, Tuple
 
 import gradio as gr
@@ -13,12 +14,12 @@ import gradio as gr
 import config as app_config
 from core.pipeline import process_multiple
 from core.batch import process_movie
-from core.subtitle import generate_word_group_srt
+from core.subtitle import generate_word_group_srt, load_external_subtitles, save_segments_json
 from utils.ffmpeg_utils import render_full_preview, _probe_duration
 from utils.log_capture import LogCapture
 from utils import user_config
 from utils.font_manager import POPULAR_FONTS, ensure_font, FONTS_DIR
-from analyzers.text_analyzer import check_api_key
+from analyzers.text_analyzer import check_ollama
 from utils import fmt_duration
 
 
@@ -191,10 +192,10 @@ body { background: #191714 !important; }
 .gradio-container ul.options li.item {
     padding: 10px 14px;
     color: #F5F4EE;
-    /* Todo 30: «обводка выбранного текста» — браузерный text-selection
-       хайлайт на кликнутом пункте (todo 15 сделал неселектируемым UI-хром,
-       но не li списков) + потенциальный UA focus-ring на активном пункте.
-       Снимаем и то, и другое; hover-подсветка фоном остаётся. */
+    /* Todo 30: remove the browser text-selection highlight on a clicked
+       item (todo 15 made UI chrome unselectable, but not list <li>s) and
+       a potential UA focus-ring on the active item. Drop both; the
+       hover background highlight stays. */
     -webkit-user-select: none !important;
     user-select: none !important;
     outline: none !important;
@@ -597,12 +598,12 @@ footer { display: none; }
 .gradio-container .wrap .progress {
     display: none !important;
 }
-/* ── FIX: native "Uploading..." — ХОТЯ БЫ нативный индикатор должен быть виден.
-    Ранее был display:none !important на .uploading — теперь force visible fallback.
-    JS скроет его только когда покажет кастомный #upload-progress, иначе остаётся видимым. ── */
+/* FIX: native "Uploading..." — the native indicator must be visible at least as a fallback.
+    Previously it had display:none !important on .uploading — now force a visible fallback.
+    JS hides it only once the custom #upload-progress is shown; otherwise it stays visible. */
 #auto-file .progress, #manual-file .progress,
 #auto-file .file-preview .progress, #manual-file .file-preview .progress { display: none !important; }
-/* native uploading — видимый fallback: block !important + цвет акцента, не конфликтует с кастомом */
+/* native uploading — visible fallback: block !important + accent color, doesn't conflict with the custom one */
 #auto-file .uploading, #manual-file .uploading,
 .gradio-container .uploading,
 .gradio-container span.uploading,
@@ -670,7 +671,7 @@ footer { display: none; }
     color: #C15F3C;
 }
 @keyframes upload-spin { to { transform: rotate(360deg); } }
-/* Done state: зелёный чек, тот же контейнер */
+/* Done state: green check, same container */
 #upload-progress .upload-done,
 #upload-progress-auto .upload-done {
     background: rgba(34,197,94,.10) !important;
@@ -777,12 +778,12 @@ async () => {
     }, { passive: true });
     // === Upload progress: deterministic 0-100% + fetch→XHR patch for Gradio 5 ===
     function _escHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-    function _loadingHtml(name){ var n=_escHtml(name||'файл'); return '<div class="upload-loading"><div class="upload-spinner"></div><span>Загрузка: '+n+' \u2014 </span><span class="upload-pct">5%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:5%"></div></div></div>'; }
-    function _doneHtml(name){ var n=_escHtml(name||'файл'); return '<div class="upload-loading upload-done"><span>Готово: '+n+' </span><span class="upload-check">\u2713</span></div>'; }
+    function _loadingHtml(name){ var n=_escHtml(name||'file'); return '<div class="upload-loading"><div class="upload-spinner"></div><span>Uploading: '+n+' \u2014 </span><span class="upload-pct">5%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:5%"></div></div></div>'; }
+    function _doneHtml(name){ var n=_escHtml(name||'file'); return '<div class="upload-loading upload-done"><span>Done: '+n+' </span><span class="upload-check">\u2713</span></div>'; }
     function _showProgress(id, html){ var el=document.getElementById(id); if(!el) return; el.innerHTML=html; el.style.setProperty('display','block','important'); el.style.setProperty('visibility','visible','important'); el.style.setProperty('opacity','1','important'); var blk=el.closest('.block'); if(blk) blk.style.setProperty('display','block','important'); el.removeAttribute('hidden'); el.hidden=false; try{ var nat=document.querySelector(id==='upload-progress-auto'?'#auto-file .uploading':'#manual-file .uploading'); if(nat) nat.style.setProperty('display','none','important'); }catch(_){} }
     function _hideProgress(id){ var el=document.getElementById(id); if(!el) return; el.style.setProperty('display','none','important'); el.innerHTML=''; el.hidden=true; if(el._hideTimer){ clearTimeout(el._hideTimer); el._hideTimer=null; } var curEl=document.getElementById(id); if(curEl && curEl._fakeIv){ clearInterval(curEl._fakeIv); curEl._fakeIv=null; } try{ var nat2=document.querySelector(id==='upload-progress-auto'?'#auto-file .uploading':'#manual-file .uploading'); if(nat2) nat2.style.removeProperty('display'); }catch(_){} }
     function _showDoneThenHide(id, name){ _showProgress(id,_doneHtml(name)); var el=document.getElementById(id); if(el){ if(el._hideTimer) clearTimeout(el._hideTimer); el._hideTimer=setTimeout(function(){ _hideProgress(id); },1500); } }
-    // initial hide — только если innerHTML пустой, иначе не трогать (фикс: 200мс снова скрывал после visible=True + drop)
+    // initial hide — only when innerHTML is empty, otherwise leave it alone (fix: a 200ms timer was re-hiding it after visible=True + drop)
     (function(){
         ['upload-progress','upload-progress-auto'].forEach(function(id){
             var el=document.getElementById(id);
@@ -823,11 +824,11 @@ async () => {
         ids.forEach(function(i){
             var el=document.getElementById(i);
             if(!el) return;
-            // FIX: previously `if(display==='none') return` блокировал обновление когда скрыто -> вечно 5%.
-            // Теперь если скрыто и pct>0 — сначала показать, затем обновить.
+            // FIX: previously `if(display==='none') return` blocked the update while hidden -> stuck at 5%.
+            // Now, when hidden and pct>0, show it first, then update.
             if(el.style.display==='none' || el.innerHTML==='' || el.innerHTML.indexOf('upload-loading')===-1){
                 if(pct>0 && el.innerHTML.indexOf('upload-done')===-1){
-                    _showProgress(i, _loadingHtml('файл'));
+                    _showProgress(i, _loadingHtml('file'));
                     el=document.getElementById(i);
                     if(!el) return;
                 } else return;
@@ -854,10 +855,11 @@ async () => {
                     else if(input && input.url) url=String(input.url);
                     if(init && init.body) body=init.body;
                     else if(input && input instanceof Request) { try{ body=input.body; }catch(_){} }
-                    // Перехватываем ТОЛЬКО настоящий FormData (загрузка файла) — у него нужен upload progress.
-                    // Раньше здесь было `|| ArrayBuffer || typeof body.entries==='function'` + URL-фильтр с 'queue'/'predict',
-                    // из-за чего перехватывались ВСЕ POST включая JSON /queue/join → XHR-шим срезал Content-Type → 422 и
-                    // «кнопка не работает». JSON-посты (строка-body) уходят в оригинальный fetch без изменений.
+                    // Intercept ONLY real FormData (a file upload) — that's what needs upload progress.
+                    // This used to also match `|| ArrayBuffer || typeof body.entries==='function'` + a URL filter
+                    // on 'queue'/'predict', which caught ALL POSTs including JSON /queue/join -> the XHR shim
+                    // stripped Content-Type -> 422 and "the button doesn't work". JSON posts (string body) go
+                    // through the original fetch unchanged.
                     var isFD=false; try{ isFD=(typeof FormData!=='undefined') && (body instanceof FormData); }catch(_){}
                     if(isFD){
                         var fname=''; try{ if(body && typeof body.entries==='function') fname=_fileNameFromFormData(body); }catch(_){}
@@ -876,7 +878,7 @@ async () => {
                         }catch(_){}
                         console.log('[upload] fetch show', targetId, fname);
                         var el=document.getElementById(targetId);
-                        if(!el || el.style.display==='none' || el.innerHTML==='') _showProgress(targetId,_loadingHtml(fname||'файл'));
+                        if(!el || el.style.display==='none' || el.innerHTML==='') _showProgress(targetId,_loadingHtml(fname||'file'));
                         // if both tabs hidden, show in manual by default, auto fetch will correct via _activeUploadId after first progress
                         return new Promise(function(resolve,reject){
                             var xhr=new XMLHttpRequest();
@@ -900,7 +902,7 @@ async () => {
                                 var doneName=fname;
                                 updateBar(100);
                                 var doneId=_activeUploadId()||targetId;
-                                _showDoneThenHide(doneId, doneName||'файл');
+                                _showDoneThenHide(doneId, doneName||'file');
                                 resolve(new Response(bodyText,{status:xhr.status,statusText:xhr.statusText,headers:headers}));
                             };
                             xhr.onerror=function(){ reject(new TypeError('Network request failed')); };
@@ -930,7 +932,7 @@ async () => {
                 if(!hasFiles && dt.items) hasFiles=dt.items.length>0;
             }
         }catch(_){}
-        // always show — even generic "файл" if name missing, never early return
+        // always show — even the generic "file" if name is missing, never early return
         var id=_targetToId(e.target);
         if(!id){
             var man=document.getElementById('manual-file'); var auto=document.getElementById('auto-file');
@@ -939,10 +941,10 @@ async () => {
             else if(!manVis && autoVis) id='upload-progress-auto';
             else id='upload-progress';
         }
-        console.log('[upload] drop resolved', id, name || 'файл');
+        console.log('[upload] drop resolved', id, name || 'file');
         var el=document.getElementById(id);
         if(el && el.style.display!=='none' && el.innerHTML.indexOf('upload-loading')!==-1 && el.innerHTML.indexOf('upload-done')===-1) return;
-        if(!name) name='файл';
+        if(!name) name='file';
         _showProgress(id, _loadingHtml(name));
         setTimeout(function(){ var curEl=document.getElementById(id); if(curEl && curEl.querySelector('.upload-pct') && curEl.querySelector('.upload-pct').textContent==='5%'){ var fake=10; var iv=setInterval(function(){ if(!curEl || curEl.style.display==='none' || curEl.innerHTML.indexOf('upload-done')!==-1){ clearInterval(iv); return; } fake+=5; if(fake>=90){ clearInterval(iv); fake=90; } var f=curEl.querySelector('.upload-bar-fill'); if(f) f.style.setProperty('--pct',fake+'%'); var pe=curEl.querySelector('.upload-pct'); if(pe) pe.textContent=fake+'%'; }, 200); curEl._fakeIv=iv; } }, 400);
     }, true);
@@ -966,7 +968,7 @@ async () => {
             if(progEl.innerHTML.indexOf('upload-loading')===-1 || progEl.innerHTML.indexOf('upload-done')!==-1) return;
             var hasFile=false; try{ var txt=fileEl.textContent||''; hasFile=txt.indexOf('.avi')!==-1||txt.indexOf('.mp4')!==-1||txt.indexOf('.mkv')!==-1||txt.indexOf('.mov')!==-1||fileEl.querySelector('.file-preview')||fileEl.querySelector('a[href*=\"gradio\"]'); }catch(_){}
             if(hasFile){
-                var nm='файл'; try{ var m=(fileEl.textContent||'').match(/[^\\s]+\\.(avi|mp4|mkv|mov)/i); if(m) nm=m[0].trim(); }catch(_){}
+                var nm='file'; try{ var m=(fileEl.textContent||'').match(/[^\\s]+\\.(avi|mp4|mkv|mov)/i); if(m) nm=m[0].trim(); }catch(_){}
                 if(progEl._fakeIv){ clearInterval(progEl._fakeIv); progEl._fakeIv=null; }
                 _showDoneThenHide(pid, nm);
             }
@@ -980,7 +982,7 @@ async () => {
             XMLHttpRequest.prototype.open=function(m,u){ this._uploadUrl=u; return openOrig.apply(this, arguments); };
             XMLHttpRequest.prototype.send=function(body){
                 try{
-                    // FIX: показывать _showProgress при любом FormData/Blob/ArrayBuffer — fallback по URL даже если тип не определился
+                    // FIX: show _showProgress for any FormData/Blob/ArrayBuffer — URL fallback even when the type wasn't determined
                     var isUpload=false;
                     try{ isUpload=(body instanceof FormData || body instanceof Blob || body instanceof ArrayBuffer || (body && body.buffer instanceof ArrayBuffer) || (body && typeof body.entries==='function') || (body && typeof body.arrayBuffer==='function')); }catch(_){}
                     try{ if(!isUpload && this._uploadUrl && typeof this._uploadUrl==='string' && this._uploadUrl.indexOf('upload')!==-1 && body) isUpload=true; }catch(_){}
@@ -998,12 +1000,12 @@ async () => {
                                 if(!manVis && autVis) targetId='upload-progress-auto';
                             }
                         }catch(_){}
-                        var el2=document.getElementById(targetId); if(!el2 || el2.style.display==='none' || el2.innerHTML==='') _showProgress(targetId, _loadingHtml(fname||'файл'));
+                        var el2=document.getElementById(targetId); if(!el2 || el2.style.display==='none' || el2.innerHTML==='') _showProgress(targetId, _loadingHtml(fname||'file'));
                         console.log('[upload] XHR send', targetId, fname);
                         // use addEventListener to not clobber Gradio's own handler
                         try{ this.upload.addEventListener('progress', function(ev){ if(ev.lengthComputable) updateBar(Math.round(ev.loaded/ev.total*100)); }); }catch(_){ try{ this.upload.onprogress=function(ev){ if(ev.lengthComputable) updateBar(Math.round(ev.loaded/ev.total*100)); }; }catch(_){} }
                         var _body=body; var _tid=targetId; var _fname=fname;
-                        this.addEventListener('load', function(){ updateBar(100); var doneId=_activeUploadId()||_tid; if(doneId){ var nm=''; try{ if(_body && typeof _body.entries==='function'){ nm=_fileNameFromFormData(_body); } }catch(_){} _showDoneThenHide(doneId, nm||_fname||'файл'); } });
+                        this.addEventListener('load', function(){ updateBar(100); var doneId=_activeUploadId()||_tid; if(doneId){ var nm=''; try{ if(_body && typeof _body.entries==='function'){ nm=_fileNameFromFormData(_body); } }catch(_){} _showDoneThenHide(doneId, nm||_fname||'file'); } });
                     }
                 }catch(_){}
                 return sendOrig.apply(this, arguments);
@@ -1057,150 +1059,6 @@ def _mask_timecode_range(text) -> str:
 # ---------------------------------------------------------------------------
 
 UI = {
-    "ru": {
-        "app_tagline": "Автоматическая нарезка фильмов на YouTube Shorts",
-        "tab_manual": "Ручной режим",
-        "tab_auto": "Автоматический режим",
-        "settings": "Настройки",
-        "process": "Обработать",
-        "auto_process": "Анализировать и обработать очередь",
-        "file_label": "Выберите видео",
-        "movie_title": "Название фильма (необязательно)",
-        "tc_range": "Таймкод",
-        "tc_hint": "Таймкоды добавляются полями: заполнили интервал — появится следующее поле",
-        "max_len": "Макс. длина клипа (сек)",
-        "processing_opts": "Опции монтажа",
-        "subs_label": "Субтитры",
-        "subs_info": "Распознаёт речь и накладывает субтитры на видео",
-        "face_label": "Smart centering (Face tracking)",
-        "face_info": "Анализирует положение лиц и центрирует кадр по ним",
-        "banner_label": "Баннерные поля",
-        "banner_info": "Добавляет поля сверху/снизу для баннеров в YouTube редакторе",
-        "banner_top": "Верхнее поле (px)",
-        "banner_bottom": "Нижнее поле (px)",
-        "blur_label": "Размытый фон",
-        "blur_info": "Заполняет пустое пространство размытой копией видео (формат 9:16)",
-        "anti_label": "Anti-copyright",
-        "anti_info": "Небольшие искажения (отражение, контраст, яркость) для обхода Content ID",
-        "film_language": "Язык фильма",
-        "film_language_info": "Язык диалогов в фильме. Определяет язык транскрипции и субтитров.",
-        "llm_provider": "LLM Провайдер",
-        "analysis_mode": "Режим анализа",
-        "analysis_mode_info": "Стандартный: детекция сцен + LLM скоринг | Контекстный: LLM видит текст всех сцен → сам выбирает лучшие",
-    "analysis_mode_std": "Стандартный",
-    "analysis_mode_ctx": "Контекстный (ИИ)",
-        "min_len": "Мин. длина (сек)",
-        "num_clips": "Количество клипов",
-        "score_threshold": "Порог оценки",
-        "score_threshold_info": "Минимальная оценка сцены (1-10) для включения в результат",
-        "waiting": "Ожидание запуска...",
-        "error_no_file": "Ошибка: загрузите видеофайл.",
-        "error_no_ts": "Ошибка: укажите хотя бы один промежуток",
-        "console": "Консоль отладки",
-        "subtitle_editor": "Редактор субтитров",
-        "font": "Шрифт",
-"sub_font_label": "Шрифт субтитров",
-  "font_no_cyr_suffix": " (без кириллицы)",
-  "font_size": "Размер",
-        "font_color": "Цвет",
-        "outline": "Обводка",
-        "bold": "Жирный",
-        "italic": "Курсив",
-        "shadow": "Тень",
-        "position_y": "Отступ от низа (px)",
-        "preview": "Предпросмотр",
-        "preview_text": "Пример текста субтитров",
-        "test_video": "Тестовое видео",
-        "preview_no_video": "Тестовое видео не найдено — положите файл (mp4/avi/mkv) в output/test_video/",
-        "preview_bad_path": "Файл не найден: {path}",
-        "preview_ok": "✅ Предпросмотр обновлён",
-        "preview_fail": "❌ Ошибка предпросмотра: {err}",
-        "preview_long_warning": "⏳ Рендер полного ролика может занять несколько минут…",
-        "auto_cleanup": "Авто-очистка temp",
-        "auto_cleanup_info": "Удалять временные файлы после обработки каждого фильма",
-        "ui_language": "Язык интерфейса",
-        "batch_files": "Выберите фильмы (можно несколько)",
-        "process_all": "Обработать все",
-        "process_queue": "Очередь обработки",
-        "wait_start": "Ожидание запуска...",
-        "apply_lang": "Применить язык",
-        "save": "Сохранить",
-        "general": "Общие",
-        "not_saved": "не сохранено",
-        "saved_ok": "✅ Настройки сохранены",
-        "saved_sub_ok": "✅ Настройки субтитров сохранены",
-        "reset_defaults": "Сбросить к дефолтным",
-        "reset_sub_ok": "✅ Настройки субтитров сброшены к заводским",
-        "add_to_queue": "Добавить в очередь",
-        "queue_empty": "Очередь пуста",
-        "restart_for_lang": "✅ Настройки сохранены (перезапустите для смены языка)",
-        "support_author": "Поддержать автора:",
-        "file_label_suffix": " — перетащите или нажмите для выбора",
-        "movie_placeholder": "Например: Матрица, 1+1, Побег из Шоушенка...",
-        "queue_header": "Очередь ({n})",
-        "llm_provider_info": "Gemini (Google AI), Yandex AI Studio, OpenRouter или OpenCode Zen",
-        "lang_russian": "Русский",
-        "lang_english": "English",
-        "tab_gemini": "Google AI (Gemini)",
-        "tab_yandex": "Yandex AI Studio",
-        "tab_openrouter": "OpenRouter",
-        "tab_opencode_zen": "OpenCode Zen",
-        "opencode_zen_model_label": "Модель OpenCode Zen",
-        "opencode_zen_model_info": "",
-        "api_key_label": "API ключ {provider}",
-        "save_key": "Сохранить ключ",
-        "check_key": "Проверить ключ",
-        "status_not_checked": "⏳ не проверен",
-        "folder_id_label": "Folder ID",
-        "yandex_model_label": "Модель Yandex",
-        "openrouter_model_label": "Модель OpenRouter",
-        "no_api_key_title": "Без API-ключа",
-        "no_api_key_desc": "Без API-ключа (и без локальной LLM через Ollama) автоматическая обработка фильма не запустится — анализ сцен обязателен.",
-        "no_api_key_works": "Что работает без ключа:",
-        "no_api_key_works_list": "локальный запуск через Ollama (без API-ключа), детекция сцен, работа с внешними субтитрами, нарезка клипов, face tracking",
-        "no_api_key_lost": "Что не будет работать совсем:",
-        "no_api_key_lost_list": "запуск без ключа и без Ollama — обработка остановится с ошибкой (случайный отбор сцен больше не поддерживается)",
-        "no_api_key_where": "Где взять ключ:",
-        "color_white": "Белый",
-        "color_yellow": "Жёлтый",
-        "color_black": "Чёрный",
-        "color_red": "Красный",
-        "color_cyan": "Голубой",
-        "color_green": "Зелёный",
-        "file_label_x": "Файл: {name}",
-        "timestamps_count": "Таймкодов: {n}",
-        "options_label": "Опции: subs={subs}, face={face}, blur={blur}, anti={anti}",
-        "processing_elapsed": "Обработка... прошло {time}",
-        "progress_done": "Готово: {done}/{total} клипов",
-        "progress_error": "Ошибка!",
-        "update_available": "Доступна новая версия {tag}",
-        "watch_release": "Смотреть",
-        "error_generic": "ОШИБКА: {msg}",
-        "error_short": "Ошибка!",
-        "done_count": "Готово: {ok}/{total} клипов",
-        "clip_error": "Клип {n}: ошибка обработки",
-        "done_count_files": "Готово: {ok}/{total} клипов (файлов: {files})",
-        "no_results": "Ошибка: нет результата",
-        "no_scenes": "Не найдено подходящих сцен.",
-        "no_scenes_short": "Не найдено сцен",
-        "total_time": "⏱  Общее время: {time}",
-        "movie_header": "MOVIESHORT AI — ФАЙЛ {i}/{total}",
-        "movie_file": "Файл: {name}",
-        "movie_title_label": "Фильм: {title}",
-        "provider_mode": "Провайдер: {prov}, Режим: {mode}",
-        "film_lang_label": "Язык: {lang}",
-        "no_api_key_warn": "⚠️  API-ключ не задан и Ollama не настроен — обработка остановится с ошибкой!",
-        "mode_context": "Контекстный",
-        "mode_standard": "Стандартный",
-        "processing_file": "[{i}/{total}] {name} — прошло {time}",
-        "key_saved": "API ключ сохранён ({provider})",
-        "key_saved_check": "Сохранено. Проверка: {error}",
-        "api_ok": "✅ API работает",
-        "key_valid_quota": "⚠️ Ключ валиден, но {error}",
-        "api_error": "❌ {error}",
-        "reset_to_defaults": "Сбросить к дефолтным",
-        "status_unknown": "статус неизвестен",
-    },
     "en": {
         "app_tagline": "Automatic movie clipping for YouTube Shorts",
         "tab_manual": "Manual mode",
@@ -1215,7 +1073,7 @@ UI = {
         "max_len": "Max clip length (s)",
         "processing_opts": "Processing options",
         "subs_label": "Subtitles",
-        "subs_info": "Recognizes speech and overlays subtitles on video",
+        "subs_info": "Uses the uploaded subtitle file to overlay subtitles on the video",
         "face_label": "Smart centering (Face tracking)",
         "face_info": "Analyzes face positions and centers the frame on them",
         "banner_label": "Banner padding",
@@ -1226,13 +1084,6 @@ UI = {
         "blur_info": "Fills empty space with a blurred copy of the video (9:16 format)",
         "anti_label": "Anti-copyright",
         "anti_info": "Subtle transformations (mirror, contrast, brightness) to bypass Content ID",
-        "film_language": "Film language",
-        "film_language_info": "Language of dialogue in the movie. Determines transcription and subtitle language.",
-        "llm_provider": "LLM Provider",
-        "analysis_mode": "Analysis mode",
-        "analysis_mode_info": "Standard: scene detection + LLM scoring | Context: LLM sees all scene transcripts → picks best",
-    "analysis_mode_std": "Standard",
-    "analysis_mode_ctx": "Context (AI)",
         "min_len": "Min length (s)",
         "num_clips": "Number of clips",
         "score_threshold": "Score threshold",
@@ -1240,6 +1091,8 @@ UI = {
         "waiting": "Waiting...",
         "error_no_file": "Error: please upload a video file.",
         "error_no_ts": "Error: please enter at least one time range",
+        "error_no_subtitle": "Error: please upload a subtitle file (.srt/.ass/.ssa/.vtt), or disable subtitles.",
+        "subtitle_file_label": "Subtitle file (.srt/.ass/.ssa/.vtt)",
         "console": "Debug console",
         "subtitle_editor": "Subtitle Editor",
         "font": "Font",
@@ -1262,7 +1115,6 @@ UI = {
         "preview_long_warning": "⏳ Rendering the full clip may take several minutes…",
         "auto_cleanup": "Auto-cleanup temp",
         "auto_cleanup_info": "Delete temporary files after processing each movie",
-        "ui_language": "Interface language",
         "batch_files": "Select movie files (multiple allowed)",
         "process_all": "Process all",
         "process_queue": "Processing queue",
@@ -1277,34 +1129,16 @@ UI = {
         "reset_sub_ok": "✅ Subtitle settings reset to defaults",
         "add_to_queue": "Add to queue",
         "queue_empty": "Queue is empty",
-        "restart_for_lang": "✅ Settings saved (restart to apply language)",
         "support_author": "Support the author:",
         "file_label_suffix": " — drag & drop or click to select",
         "movie_placeholder": "e.g. The Matrix, The Shawshank Redemption...",
         "queue_header": "Queue ({n})",
-        "llm_provider_info": "Gemini (Google AI), Yandex AI Studio, OpenRouter or OpenCode Zen",
-        "lang_russian": "Russian",
-        "lang_english": "English",
-        "tab_gemini": "Google AI (Gemini)",
-        "tab_yandex": "Yandex AI Studio",
-        "tab_openrouter": "OpenRouter",
-        "tab_opencode_zen": "OpenCode Zen",
-        "opencode_zen_model_label": "OpenCode Zen Model",
-        "opencode_zen_model_info": "",
-        "api_key_label": "{provider} API key",
-        "save_key": "Save key",
-        "check_key": "Check key",
+        "tab_local_model": "Local Model",
+        "local_model_label": "Model",
+        "local_model_via": "via",
+        "local_model_no_key": "No API key needed.",
+        "check_key": "Check connection",
         "status_not_checked": "⏳ not checked",
-        "folder_id_label": "Folder ID",
-        "yandex_model_label": "Yandex Model",
-        "openrouter_model_label": "OpenRouter Model",
-        "no_api_key_title": "Without API key",
-        "no_api_key_desc": "Without an API key (and without a local Ollama model), automatic movie processing will not run — subtitle-based AI scene analysis is required.",
-        "no_api_key_works": "What still works without a key:",
-        "no_api_key_works_list": "running locally via Ollama (no API key needed), scene detection, external subtitle parsing, clip cutting, face tracking",
-        "no_api_key_lost": "What stops entirely:",
-        "no_api_key_lost_list": "running with neither a key nor Ollama configured — processing stops with an error (random scene selection is no longer supported)",
-        "no_api_key_where": "Where to get the key:",
         "color_white": "White",
         "color_yellow": "Yellow",
         "color_black": "Black",
@@ -1331,36 +1165,29 @@ UI = {
         "movie_header": "MOVIESHORT AI — FILE {i}/{total}",
         "movie_file": "File: {name}",
         "movie_title_label": "Movie: {title}",
-        "provider_mode": "Provider: {prov}, Mode: {mode}",
-        "film_lang_label": "Language: {lang}",
-        "no_api_key_warn": "⚠️  No API key set and Ollama is not configured — processing will stop with an error!",
-        "mode_context": "Context",
-        "mode_standard": "Standard",
         "processing_file": "[{i}/{total}] {name} — elapsed {time}",
-        "key_saved": "API key saved ({provider})",
-        "key_saved_check": "Saved. Check: {error}",
         "api_ok": "✅ API is working",
-        "key_valid_quota": "⚠️ Key is valid, but {error}",
-        "api_error": "❌ {error}",
         "reset_to_defaults": "Reset to defaults",
         "status_unknown": "status unknown",
     },
 }
 
-LANG_RU = "ru"
 LANG_EN = "en"
 
 
-def _t(key, lang="ru", default=None):
-    """Translate a UI string by key and language.
+def _t(key, lang="en", default=None):
+    """Look up a UI string by key.
+
+    The app is English-only; `lang` is accepted for call-site compatibility
+    and is otherwise ignored.
 
     Args:
         key: translation key
-        lang: language code ('ru' or 'en')
+        lang: unused, kept for compatibility
         default: fallback if key not found (defaults to key itself)
     """
     fallback = key if default is None else default
-    return UI.get(lang, UI["ru"]).get(key, fallback)
+    return UI["en"].get(key, fallback)
 
 
 def _get_font_style(cfg):
@@ -1398,24 +1225,7 @@ def _make_progress_html(pct: float, label: str = "") -> str:
 </div>"""
 
 
-def _provider_note_html(title, desc, works, works_list, lost, lost_list,
-                        where_url, where_label, where_heading=""):
-    """Unified indigo 'works without API key' note for every provider tab
-    (todo 9): one color scheme instead of per-provider orange/green."""
-    heading_html = f"<strong style=\"color:#ffffff !important;\">{where_heading}</strong>\n  " if where_heading else ""
-    return f"""<div style="margin-top:12px;padding:16px;background:rgba(193,95,60,0.08);border-left:4px solid #CC785C;border-radius:10px;font-size:14px;line-height:1.7;color:#F5F4EE !important;">
-  <strong style="color:#ffffff !important;font-size:15px;">{title}</strong><br>
-  <span style="color:#C2C0B6 !important;">{desc}</span>
-  <br><br>
-  <strong style="color:#ffffff !important;">{works}</strong><span style="color:#C2C0B6 !important;"> {works_list}</span>
-  <br>
-  <strong style="color:#ffffff !important;">{lost}</strong><span style="color:#C2C0B6 !important;"> {lost_list}</span>
-  <br><br>
-  {heading_html}<a href="{where_url}" target="_blank" style="color:#D4A27F !important;font-weight:500;">{where_label}</a>
-</div>"""
-
-
-def _check_for_update(lang="ru"):
+def _check_for_update(lang="en"):
     """Check GitHub for newer release. Returns banner HTML or empty string."""
     try:
         import httpx
@@ -1516,13 +1326,13 @@ def _try_remove_gradio_temp(p: str) -> None:
         if p and _is_gradio_temp_path(p) and os.path.isfile(p):
             import os as _os2  # noqa: F811
             _os2.unlink(p)
-            print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} удалён")
+            print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} removed")
     except Exception:
         pass
 
 
 def cleanup_gradio_temp(max_age_seconds: int = 86400) -> int:
-    """Стартап-чистка Temp/gradio старше max_age_seconds. Returns removed count."""
+    """Startup cleanup of Temp/gradio files older than max_age_seconds. Returns removed count."""
     try:
         import tempfile
         import time
@@ -1545,28 +1355,22 @@ def cleanup_gradio_temp(max_age_seconds: int = 86400) -> int:
             except Exception:
                 pass
         if removed:
-            print(f"\U0001f9f9 Gradio temp: удалено {removed} старых файлов")
+            print(f"\U0001f9f9 Gradio temp: removed {removed} old file(s)")
         return removed
     except Exception:
         return 0
 
 
 def create_app() -> gr.Blocks:
-    # стартап-чистка Gradio temp
+    # Startup cleanup of Gradio temp
     try:
         cleanup_gradio_temp()
     except Exception:
         pass
     # Load persisted settings
     cfg = user_config.load()
-    # Actual cost per minute from billing data: 31 руб / 246 мин = 0.13 руб/мин
     cfg["cost_per_minute"] = 0.13
-    ui_lang = cfg.get("ui_language", "ru")
-
-    # Sync API key to runtime config
-    import config as cfg_module
-    if cfg.get("api_key"):
-        cfg_module.GEMINI_API_KEY = cfg["api_key"]
+    ui_lang = "en"
 
     with gr.Blocks(
         title="MovieShort AI",
@@ -1656,29 +1460,34 @@ def create_app() -> gr.Blocks:
                         fn=_tc_reveal, inputs=tc_boxes[_i],
                         outputs=tc_boxes[_i + 1])
 
-                # Upload progress: изолировано по вкладкам, имя файла + Done 1.5с
+                # Upload progress: per-tab, shows filename + Done for 1.5s
                 def _esc_html(s):
                     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-                UPLOAD_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Загрузка: файл \u2014 </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
+                UPLOAD_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Uploading: file — </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
                 def _on_manual_upload(f):
                     if f is None:
                         return gr.update(value="", visible=False)
                     try:
-                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "файл"
+                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "file"
                     except Exception:
-                        name = "файл"
+                        name = "file"
                     esc = _esc_html(name)
-                    done_html = f'<div class="upload-loading upload-done"><span>Готово: {esc} </span><span class="upload-check">\u2713</span></div>'
+                    done_html = f'<div class="upload-loading upload-done"><span>Done: {esc} </span><span class="upload-check">✓</span></div>'
                     return gr.update(value=done_html, visible=True)
                 def _on_manual_upload_show():
                     return gr.update(value=UPLOAD_LOADING_HTML, visible=True)
-                # upload срабатывает в начале копирования в Temp/gradio; change — после завершения
+                # upload fires when copying into Temp/gradio starts; change fires once it completes
                 try:
                     video_file.upload(fn=_on_manual_upload_show, inputs=None, outputs=upload_progress)
                 except Exception:
                     pass
                 video_file.change(fn=_on_manual_upload, inputs=video_file, outputs=upload_progress)
                 video_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=upload_progress)
+                subtitle_file = gr.File(
+                    label=_t("subtitle_file_label", ui_lang),
+                    file_types=[".srt", ".ass", ".ssa", ".vtt"],
+                    elem_id="manual-subtitle-file",
+                )
                 with gr.Group():
                     gr.Markdown(f"### {_t('processing_opts', ui_lang)}")
                     m_subs = gr.Checkbox(value=cfg.get("subtitles", True),
@@ -1712,13 +1521,17 @@ def create_app() -> gr.Blocks:
                     value=_t("wait_start", ui_lang) + "\n"
                 )
 
-                def on_process(file, subs, face, banner, bt, bb, blur, anti,
+                def on_process(file, subtitle_upload, subs, face, banner, bt, bb, blur, anti,
                                sub_font_name, sub_size, sub_outline, sub_color_name,
                                sub_bold, sub_italic, sub_shadow, sub_position,
                                *tc_values, _lang=ui_lang):
                     if file is None:
                         yield (_t("error_no_file", _lang),
                                _make_progress_html(0, _t("error_no_file", _lang)))
+                        return
+                    if subs and subtitle_upload is None:
+                        yield (_t("error_no_subtitle", _lang),
+                               _make_progress_html(0, _t("error_no_subtitle", _lang)))
                         return
                     # Assemble "start - end" lines from filled range-fields
                     # (the mask already yields that shape); parse_timestamps
@@ -1735,10 +1548,23 @@ def create_app() -> gr.Blocks:
                         return
 
                     video_path = file.name if hasattr(file, 'name') else str(file)
+
+                    # Parse the uploaded external subtitle file into a transcript
+                    # JSON usable by process_clip (subtitle-only pipeline).
+                    transcript_path = None
+                    if subtitle_upload is not None:
+                        try:
+                            sub_path = subtitle_upload.name if hasattr(subtitle_upload, "name") else str(subtitle_upload)
+                            segments = load_external_subtitles(sub_path)
+                            os.makedirs(app_config.TEMP_DIR, exist_ok=True)
+                            transcript_path = str(app_config.TEMP_DIR / f"{Path(video_path).stem}_subs.json")
+                            save_segments_json(segments, transcript_path)
+                        except Exception as e:
+                            yield (f"Subtitle error: {e}", _make_progress_html(0, f"Subtitle error: {e}"))
+                            return
+
                     # --- subtitle style from Editor (R7b-7): must flow to pipeline ---
-                    _cmap_ru = {"Белый": "&H00FFFFFF", "Жёлтый": "&H0000FFFF", "Чёрный": "&H00000000", "Красный": "&H000000FF", "Голубой": "&H00FFFF00", "Зелёный": "&H0000FF00"}
-                    _cmap_en = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
-                    _cmap = _cmap_en if _lang == "en" else _cmap_ru
+                    _cmap = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
                     _cval = _cmap.get(sub_color_name, "&H00FFFFFF")
                     try:
                         _font_family = ensure_font(sub_font_name, FONTS_DIR)
@@ -1762,14 +1588,15 @@ def create_app() -> gr.Blocks:
                         "subtitle_shadow": bool(sub_shadow),
                         "subtitle_position_y": int(sub_position) if sub_position is not None else 400,
                         "font_style": _font_style,
+                        "transcript_path": transcript_path,
                     }
 
                     capture = LogCapture()
                     capture.start_capture()
 
-                    print(f"Файл: {os.path.basename(video_path)}")
-                    print(f"Таймкодов: {len(pairs)}")
-                    print(f"Опции: subs={subs}, face={face}, blur={blur}, anti={anti}")
+                    print(f"File: {os.path.basename(video_path)}")
+                    print(f"Timestamps: {len(pairs)}")
+                    print(f"Options: subs={subs}, face={face}, blur={blur}, anti={anti}")
 
                     results_container = []
                     error_container = []
@@ -1808,14 +1635,14 @@ def create_app() -> gr.Blocks:
                     if new_lines:
                         all_lines.extend(new_lines)
 
-                    # T14: автоочистка Gradio temp после обработки
+                    # T14: automatic Gradio temp cleanup after processing
                     try:
                         if file and hasattr(file, 'name'):
                             p = str(file.name)
                             if os.path.sep + "Temp" + os.path.sep in p or "gradio" in p.lower():
                                 import os as _os2
                                 _os2.unlink(p)
-                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} удалён")
+                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} removed")
                     except Exception:
                         pass
                     # fallback via helper (covers edge where p already in video_path)
@@ -1825,23 +1652,23 @@ def create_app() -> gr.Blocks:
                         pass
 
                     if error_container:
-                        print(f"\nОШИБКА: {error_container[0]}")
+                        print(f"\nERROR: {error_container[0]}")
                         label = _t("progress_error", _lang)
                     elif results_container:
                         results = results_container[0]
                         successes = [r for r in results if r is not None]
-                        print(f"\nГотово: {len(successes)}/{len(results)} клипов")
+                        print(f"\nDone: {len(successes)}/{len(results)} clips")
                         for r in successes:
                             print(f"  + {os.path.basename(r)}")
                         for i, r in enumerate(results):
                             if r is None:
-                                print(f"  - Клип {i+1}: ошибка обработки")
+                                print(f"  - Clip {i+1}: processing error")
                         label = _t("progress_done", _lang).format(
                             done=len(successes), total=len(results))
                         elapsed_total = time_module.time() - start_ts
-                        print(f"\n⏱  Общее время: {_fmt_duration(elapsed_total)}")
+                        print(f"\n⏱  Total time: {_fmt_duration(elapsed_total)}")
                     else:
-                        print("\nОшибка: нет результата")
+                        print("\nError: no result")
                         label = _t("progress_error", _lang)
 
                     capture.stop_capture()
@@ -1862,16 +1689,16 @@ def create_app() -> gr.Blocks:
                 )
                 auto_upload_progress = gr.HTML(value="", visible=True, elem_id="upload-progress-auto")
 
-                AUTO_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Загрузка: файл \u2014 </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
+                AUTO_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Uploading: file \u2014 </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
                 def _on_auto_upload(f):
                     if f is None:
                         return gr.update(value="", visible=False)
                     try:
-                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "файл"
+                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "file"
                     except Exception:
-                        name = "файл"
+                        name = "file"
                     esc = _esc_html(name)
-                    done_html = f'<div class="upload-loading upload-done"><span>Готово: {esc} </span><span class="upload-check">\u2713</span></div>'
+                    done_html = f'<div class="upload-loading upload-done"><span>Done: {esc} </span><span class="upload-check">\u2713</span></div>'
                     return gr.update(value=done_html, visible=True)
                 def _on_auto_upload_show():
                     return gr.update(value=AUTO_LOADING_HTML, visible=True)
@@ -1881,6 +1708,11 @@ def create_app() -> gr.Blocks:
                     pass
                 auto_file.change(fn=_on_auto_upload, inputs=auto_file, outputs=auto_upload_progress)
                 auto_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=auto_upload_progress)
+                auto_subtitle_file = gr.File(
+                    label=_t("subtitle_file_label", ui_lang),
+                    file_types=[".srt", ".ass", ".ssa", ".vtt"],
+                    elem_id="auto-subtitle-file",
+                )
                 with gr.Row():
                     movie_title_box = gr.Textbox(
                         label=_t("movie_title", ui_lang),
@@ -1897,48 +1729,36 @@ def create_app() -> gr.Blocks:
                     items = ""
                     for i, item in enumerate(q):
                         title_part = f" — {item['title']}" if item.get("title") else ""
+                        sub_part = " 📝" if item.get("subtitle_path") else " ⚠️ no subtitles"
                         items += f'<div style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;align-items:center">'
                         items += f'<span style="margin-right:8px;font-weight:bold;color:#D4A27F">{i+1}.</span>'
-                        items += f'<span>📁 {item["name"]}{title_part}</span></div>'
+                        items += f'<span>📁 {item["name"]}{title_part}{sub_part}</span></div>'
                     n = len(q)
                     label = _t("queue_header", ui_lang).format(n=n)
                     return f'<div style="border:1px solid rgba(255,255,255,0.12);border-radius:10px;max-height:200px;overflow-y:auto;background:rgba(26,24,20,0.5)"><div style="padding:6px 10px;background:rgba(255,255,255,0.06);font-weight:bold;border-bottom:1px solid rgba(255,255,255,0.12)">{label}</div>{items}</div>'
 
-                def _add_to_queue(q, file, title):
+                def _add_to_queue(q, file, subtitle_upload, title):
                     if file is None:
-                        return q, _render_queue(q), None, title
+                        return q, _render_queue(q), None, None, title
                     import os
                     fpath = file.name if hasattr(file, "name") else str(file)
-                    new_item = {"path": fpath, "title": title or "", "name": os.path.basename(fpath)}
+                    sub_path = None
+                    if subtitle_upload is not None:
+                        sub_path = subtitle_upload.name if hasattr(subtitle_upload, "name") else str(subtitle_upload)
+                    new_item = {
+                        "path": fpath,
+                        "title": title or "",
+                        "name": os.path.basename(fpath),
+                        "subtitle_path": sub_path,
+                    }
                     new_q = list(q or []) + [new_item]
-                    return new_q, _render_queue(new_q), None, ""
+                    return new_q, _render_queue(new_q), None, None, ""
 
                 add_queue_btn.click(
                     fn=_add_to_queue,
-                    inputs=[queue_state, auto_file, movie_title_box],
-                    outputs=[queue_state, queue_display, auto_file, movie_title_box],
+                    inputs=[queue_state, auto_file, auto_subtitle_file, movie_title_box],
+                    outputs=[queue_state, queue_display, auto_file, auto_subtitle_file, movie_title_box],
                 ).then(fn=lambda: gr.update(value="", visible=False), inputs=[], outputs=[auto_upload_progress])
-                llm_provider = gr.Radio(
-                    choices=["Gemini", "Yandex", "OpenRouter", "OpenCode Zen"],
-                    value={"gemini": "Gemini", "yandex": "Yandex", "openrouter": "OpenRouter", "opencode_zen": "OpenCode Zen"}.get(
-                        cfg.get("llm_provider", "gemini"), "Gemini"
-                    ),
-                    label=_t("llm_provider", ui_lang),
-                    info=_t("llm_provider_info", ui_lang),
-                )
-                analysis_mode = gr.Radio(
-                    choices=[_t("analysis_mode_std", ui_lang, "Стандартный"),
-                             _t("analysis_mode_ctx", ui_lang, "Контекстный (ИИ)")],
-                    value=_t("analysis_mode_ctx", ui_lang, "Контекстный (ИИ)") if cfg.get("analysis_mode", "context") == "context" else _t("analysis_mode_std", ui_lang, "Стандартный"),
-                    label=_t("analysis_mode", ui_lang),
-                    info=_t("analysis_mode_info", ui_lang),
-                )
-                film_lang = gr.Radio(
-                    choices=[_t("lang_russian", ui_lang), _t("lang_english", ui_lang)],
-                    value=_t("lang_english", ui_lang) if cfg.get("film_language", "ru") == "en" else _t("lang_russian", ui_lang),
-                    label=_t("film_language", ui_lang),
-                    info=_t("film_language_info", ui_lang),
-                )
                 with gr.Row():
                     min_dur = gr.Slider(
                         minimum=15, maximum=60,
@@ -1998,7 +1818,6 @@ def create_app() -> gr.Blocks:
                 def on_auto_process(queue, min_d, max_d,
                                     n_clips, s_thresh,
                                     subs, face, banner, bt, bb, blur, anti,
-                                    provider, mode, film_lang_val,
                                     sub_font_name, sub_size, sub_outline, sub_color_name,
                                     sub_bold, sub_italic, sub_shadow, sub_position,
                                     _lang=ui_lang):
@@ -2019,26 +1838,8 @@ def create_app() -> gr.Blocks:
                     cfg_save["anti_copyright"] = anti
                     cfg_save["num_clips"] = n_clips
                     cfg_save["score_threshold"] = s_thresh
-                    cfg_save["llm_provider"] = {"Gemini": "gemini", "Yandex": "yandex", "OpenRouter": "openrouter", "OpenCode Zen": "opencode_zen"}.get(provider, "gemini")
-                    is_context = mode and ("Контекстный" in mode or "Context" in mode)
-                    cfg_save["analysis_mode"] = "context" if is_context else "standard"
-                    cfg_save["film_language"] = "en" if film_lang_val and "English" in film_lang_val else "ru"
                     cleanup = cfg_save.get("auto_cleanup", True)
                     user_config.save(cfg_save)
-
-                    # Get API key from runtime config
-                    import config as cfg_runtime
-                    llm_provider_val = {"Gemini": "gemini", "Yandex": "yandex", "OpenRouter": "openrouter", "OpenCode Zen": "opencode_zen"}.get(provider, "gemini")
-                    analysis_mode_val = "context" if is_context else "standard"
-                    if llm_provider_val == "yandex":
-                        api_key = cfg_runtime.YANDEX_API_KEY
-                    elif llm_provider_val == "openrouter":
-                        api_key = getattr(cfg_runtime, 'OPENROUTER_API_KEY', '')
-                    elif llm_provider_val == "opencode_zen":
-                        api_key = getattr(cfg_runtime, 'OPENCODE_ZEN_API_KEY', '')
-                    else:
-                        api_key = cfg_runtime.GEMINI_API_KEY
-                    film_language = "en" if film_lang_val and "English" in film_lang_val else "ru"
 
                     # Process each file in queue
                     all_results = []
@@ -2046,11 +1847,10 @@ def create_app() -> gr.Blocks:
                     for file_idx, item in enumerate(queue):
                         video_path = item["path"]
                         movie_title = item.get("title", "")
+                        subtitle_path = item.get("subtitle_path")
 
                         # subtitle style (R7b-7) — Editor controls flow to pipeline
-                        _cmap_ru2 = {"Белый": "&H00FFFFFF", "Жёлтый": "&H0000FFFF", "Чёрный": "&H00000000", "Красный": "&H000000FF", "Голубой": "&H00FFFF00", "Зелёный": "&H0000FF00"}
-                        _cmap_en2 = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
-                        _cmap2 = _cmap_en2 if _lang == "en" else _cmap_ru2
+                        _cmap2 = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
                         _cval2 = _cmap2.get(sub_color_name, "&H00FFFFFF")
                         try:
                             _font_family2 = ensure_font(sub_font_name, FONTS_DIR)
@@ -2068,11 +1868,8 @@ def create_app() -> gr.Blocks:
                             "banner_bottom": bb,
                             "num_clips": n_clips,
                             "score_threshold": s_thresh,
-                            "api_key": api_key,
                             "movie_title": movie_title,
-                            "llm_provider": llm_provider_val,
-                            "analysis_mode": analysis_mode_val,
-                            "film_language": film_language,
+                            "subtitle_path": subtitle_path,
                             "auto_cleanup": cleanup,
                             "subtitle_font_name": sub_font_name,
                             "subtitle_font": _font_family2,
@@ -2096,10 +1893,9 @@ def create_app() -> gr.Blocks:
                         print("=" * 60)
                         if movie_title:
                             print(f"{_t('movie_title', _lang)}: {movie_title}")
-                        print(f"{_t('llm_provider', _lang)}: {provider}, {_t('analysis_mode', _lang)}: {_t('analysis_mode_ctx' if is_context else 'analysis_mode_std', _lang)}")
-                        print(f"{_t('film_language', _lang)}: {film_language}")
-                        if not api_key:
-                            print(f"⚠️ {_t('no_api_key_warn', _lang)}")
+                        print("LLM: local Ollama model")
+                        if not subtitle_path:
+                            print("⚠️ No subtitle file attached — relying on automatic discovery next to the video file.")
                         print()
 
                         results_container = []
@@ -2141,13 +1937,13 @@ def create_app() -> gr.Blocks:
                         if new_lines:
                             all_lines.extend(new_lines)
 
-                        # T14: автоочистка Gradio temp для пакетного режима
+                        # T14: automatic Gradio temp cleanup for batch mode
                         try:
                             p = str(video_path)
                             if os.path.sep + "Temp" + os.path.sep in p or "gradio" in p.lower():
                                 import os as _os2
                                 _os2.unlink(p)
-                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} удалён")
+                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} removed")
                         except Exception:
                             pass
                         try:
@@ -2184,130 +1980,15 @@ def create_app() -> gr.Blocks:
         # ── Settings ───────────────────────────────────────────
         with gr.Accordion(_t("settings", ui_lang), open=False):
             with gr.Tabs():
-                with gr.Tab(_t("tab_gemini", ui_lang)):
-                    gemini_key_box = gr.Textbox(
-                        label=_t("api_key_label", ui_lang).format(provider="Gemini"),
-                        type="password",
-                        value=cfg.get("api_key", ""),
+                with gr.Tab(_t("tab_local_model", ui_lang)):
+                    gr.Markdown(
+                        f"**{_t('local_model_label', ui_lang)}:** `{app_config.OLLAMA_MODEL}` "
+                        f"{_t('local_model_via', ui_lang)} Ollama (`{app_config.OLLAMA_BASE_URL}`). "
+                        f"{_t('local_model_no_key', ui_lang)}"
                     )
-                    with gr.Row():
-                        save_gemini_btn = gr.Button(_t("save_key", ui_lang))
-                        check_gemini_btn = gr.Button(_t("check_key", ui_lang), variant="secondary")
-                    gemini_status = gr.HTML(
+                    check_local_model_btn = gr.Button(_t("check_key", ui_lang), variant="secondary")
+                    local_model_status = gr.HTML(
                         value='<span style="color:#9C988B">' + _t("status_not_checked", ui_lang) + '</span>',
-                    )
-                    gr.HTML(
-                        value=_provider_note_html(
-                            _t("no_api_key_title", ui_lang),
-                            _t("no_api_key_desc", ui_lang),
-                            _t("no_api_key_works", ui_lang),
-                            _t("no_api_key_works_list", ui_lang),
-                            _t("no_api_key_lost", ui_lang),
-                            _t("no_api_key_lost_list", ui_lang),
-                            "https://aistudio.google.com/apikey",
-                            "Google AI Studio",
-                            where_heading=_t("no_api_key_where", ui_lang),
-                        ),
-                    )
-
-                with gr.Tab(_t("tab_yandex", ui_lang)):
-                    with gr.Row():
-                        yandex_key_box = gr.Textbox(
-                            label=_t("api_key_label", ui_lang).format(provider="Yandex"),
-                            type="password",
-                            value=cfg.get("yandex_api_key", ""),
-                        )
-                        yandex_folder_box = gr.Textbox(
-                            label=_t("folder_id_label", ui_lang),
-                            value=cfg.get("yandex_folder_id", ""),
-                        )
-                        yandex_model_dropdown = gr.Dropdown(
-                            choices=app_config.YANDEX_MODEL_LIST,
-                            label=_t("yandex_model_label", ui_lang),
-                            value=cfg.get("yandex_model", "yandexgpt-lite"),
-                        )
-                    with gr.Row():
-                        save_yandex_btn = gr.Button(_t("save_key", ui_lang))
-                        check_yandex_btn = gr.Button(_t("check_key", ui_lang), variant="secondary")
-                    yandex_status = gr.HTML(
-                        value='<span style="color:#9C988B">' + _t("status_not_checked", ui_lang) + '</span>',
-                    )
-                    gr.HTML(
-                        value=_provider_note_html(
-                            _t("no_api_key_title", ui_lang),
-                            _t("no_api_key_desc", ui_lang),
-                            _t("no_api_key_works", ui_lang),
-                            _t("no_api_key_works_list", ui_lang),
-                            _t("no_api_key_lost", ui_lang),
-                            _t("no_api_key_lost_list", ui_lang),
-                            "https://aistudio.yandex.cloud/platform/",
-                            "Yandex AI Studio",
-                            where_heading=_t("no_api_key_where", ui_lang),
-                        ),
-                    )
-
-                with gr.Tab(_t("tab_openrouter", ui_lang)):
-                    with gr.Row():
-                        openrouter_key_box = gr.Textbox(
-                            label=_t("api_key_label", ui_lang).format(provider="OpenRouter"),
-                            type="password",
-                            value=cfg.get("openrouter_api_key", ""),
-                        )
-                        openrouter_model_dropdown = gr.Dropdown(
-                            choices=app_config.OPENROUTER_MODEL_LIST,
-                            label=_t("openrouter_model_label", ui_lang),
-                            value=cfg.get("openrouter_model", app_config.OPENROUTER_MODEL),
-                        )
-                    with gr.Row():
-                        save_openrouter_btn = gr.Button(_t("save_key", ui_lang))
-                        check_openrouter_btn = gr.Button(_t("check_key", ui_lang), variant="secondary")
-                    openrouter_status = gr.HTML(
-                        value='<span style="color:#9C988B">' + _t("status_not_checked", ui_lang) + '</span>',
-                    )
-                    gr.HTML(
-                        value=_provider_note_html(
-                            _t("no_api_key_title", ui_lang),
-                            _t("no_api_key_desc", ui_lang),
-                            _t("no_api_key_works", ui_lang),
-                            _t("no_api_key_works_list", ui_lang),
-                            _t("no_api_key_lost", ui_lang),
-                            _t("no_api_key_lost_list", ui_lang),
-                            "https://openrouter.ai/keys",
-                            "OpenRouter",
-                            where_heading=_t("no_api_key_where", ui_lang),
-                        ),
-                    )
-
-                with gr.Tab(_t("tab_opencode_zen", ui_lang)):
-                    with gr.Row():
-                        opencode_zen_key_box = gr.Textbox(
-                            label=_t("api_key_label", ui_lang).format(provider="OpenCode Zen"),
-                            type="password",
-                            value=cfg.get("opencode_zen_api_key", ""),
-                        )
-                        opencode_zen_model_dropdown = gr.Dropdown(
-                            choices=app_config.OPENCODE_ZEN_MODEL_LIST,
-                            label=_t("opencode_zen_model_label", ui_lang),
-                            value=cfg.get("opencode_zen_model", app_config.OPENCODE_ZEN_MODEL),
-                        )
-                    with gr.Row():
-                        save_opencode_zen_btn = gr.Button(_t("save_key", ui_lang))
-                        check_opencode_zen_btn = gr.Button(_t("check_key", ui_lang), variant="secondary")
-                    opencode_zen_status = gr.HTML(
-                        value='<span style="color:#9C988B">' + _t("status_not_checked", ui_lang) + '</span>',
-                    )
-                    gr.HTML(
-                        value=_provider_note_html(
-                            _t("no_api_key_title", ui_lang),
-                            _t("no_api_key_desc", ui_lang),
-                            _t("no_api_key_works", ui_lang),
-                            _t("no_api_key_works_list", ui_lang),
-                            _t("no_api_key_lost", ui_lang),
-                            _t("no_api_key_lost_list", ui_lang),
-                            "https://opencode.ai/auth",
-                            "OpenCode Zen",
-                            where_heading=_t("no_api_key_where", ui_lang),
-                        ),
                     )
                 # ── Subtitle Editor tab ──
                 with gr.Tab(_t("subtitle_editor", ui_lang)):
@@ -2326,14 +2007,6 @@ def create_app() -> gr.Blocks:
                             label=_t("font_size", ui_lang))
                         sub_outline = gr.Slider(0, 5, value=initial_fs["outline"], step=1,
                             label=_t("outline", ui_lang))
-                    _COLOR_MAP_RU = {
-                        "Белый": "&H00FFFFFF",
-                        "Жёлтый": "&H0000FFFF",
-                        "Чёрный": "&H00000000",
-                        "Красный": "&H000000FF",
-                        "Голубой": "&H00FFFF00",
-                        "Зелёный": "&H0000FF00",
-                    }
                     _COLOR_MAP_EN = {
                         _t("color_white", "en"): "&H00FFFFFF",
                         _t("color_yellow", "en"): "&H0000FFFF",
@@ -2342,7 +2015,7 @@ def create_app() -> gr.Blocks:
                         _t("color_cyan", "en"): "&H00FFFF00",
                         _t("color_green", "en"): "&H0000FF00",
                     }
-                    _COLOR_MAP = _COLOR_MAP_EN if ui_lang == "en" else _COLOR_MAP_RU
+                    _COLOR_MAP = _COLOR_MAP_EN
                     _COLOR_TO_NAME = {v: k for k, v in _COLOR_MAP.items()}
                     _initial_color_name = _COLOR_TO_NAME.get(initial_fs["color"], list(_COLOR_MAP.keys())[0])
                     sub_color = gr.Dropdown(
@@ -2382,7 +2055,7 @@ def create_app() -> gr.Blocks:
                     preview_video = gr.Video(value=None, label=_t("preview", ui_lang),
                                              elem_classes="preview-video")
 
-                    _PREVIEW_COLOR_MAP = _COLOR_MAP_EN if ui_lang == "en" else _COLOR_MAP_RU
+                    _PREVIEW_COLOR_MAP = _COLOR_MAP_EN
 
                     def _run_video_preview(font_name, size, outline,
                                            color_name, bold, italic, shadow, pos,
@@ -2452,7 +2125,7 @@ def create_app() -> gr.Blocks:
                                 a_banner_bottom, a_blur, a_anti],
                         outputs=[preview_video, sub_status])
 
-                    _SAVE_COLOR_MAP = _COLOR_MAP_EN if ui_lang == "en" else _COLOR_MAP_RU
+                    _SAVE_COLOR_MAP = _COLOR_MAP_EN
                     def _save_sub_settings(font_name, size, outline, color_name, bold, italic, shadow, pos):
                         cval = _SAVE_COLOR_MAP.get(color_name, "&H00FFFFFF")
                         cfg_k = user_config.load()
@@ -2471,7 +2144,7 @@ def create_app() -> gr.Blocks:
                         cfg_k["subtitle_shadow"] = shadow
                         cfg_k["subtitle_position_y"] = pos
                         user_config.save(cfg_k)
-                        return f'<span style="color:green">{_t("saved_sub_ok", cfg_k.get("ui_language", "ru"))}</span>'
+                        return f'<span style="color:green">{_t("saved_sub_ok", "en")}</span>'
                     save_sub_btn.click(fn=_save_sub_settings,
                         inputs=[sub_font_dd, sub_size, sub_outline, sub_color,
                                 sub_bold, sub_italic, sub_shadow, sub_position],
@@ -2490,9 +2163,9 @@ def create_app() -> gr.Blocks:
                         cfg_k["subtitle_shadow"] = False
                         cfg_k["subtitle_position_y"] = 400
                         user_config.save(cfg_k)
-                        _reset_color_map = _COLOR_MAP_EN if _lang == "en" else _COLOR_MAP_RU
+                        _reset_color_map = _COLOR_MAP_EN
                         default_color = list(_reset_color_map.keys())[0]
-                        msg = f'<span style="color:green">{_t("reset_sub_ok", cfg_k.get("ui_language", "ru"))}</span>'
+                        msg = f'<span style="color:green">{_t("reset_sub_ok", "en")}</span>'
                         return ("Bebas Neue", 13, 1, default_color, True, False, False, 400,
                                 msg)
                     reset_sub_btn.click(fn=_reset_sub_defaults,
@@ -2505,7 +2178,7 @@ def create_app() -> gr.Blocks:
                     # run_btn (manual) and auto_btn now include 8 subtitle controls
                     run_btn.click(
                         fn=on_process,
-                        inputs=[video_file,
+                        inputs=[video_file, subtitle_file,
                                 m_subs, m_face, m_banner, m_banner_top, m_banner_bottom,
                                 m_blur, m_anti,
                                 sub_font_dd, sub_size, sub_outline, sub_color,
@@ -2518,7 +2191,6 @@ def create_app() -> gr.Blocks:
                                 num_clips, score_thresh,
                                 a_subs, a_face, a_banner, a_banner_top, a_banner_bottom,
                                 a_blur, a_anti,
-                                llm_provider, analysis_mode, film_lang,
                                 sub_font_dd, sub_size, sub_outline, sub_color,
                                 sub_bold, sub_italic, sub_shadow, sub_position],
                         outputs=[auto_log, auto_progress],
@@ -2535,152 +2207,26 @@ def create_app() -> gr.Blocks:
                         label=_t("auto_cleanup", ui_lang),
                         info=_t("auto_cleanup_info", ui_lang),
                     )
-                    ui_lang_radio = gr.Radio(
-                        choices=[_t("lang_russian", ui_lang), _t("lang_english", ui_lang)],
-                        value=_t("lang_english", ui_lang) if cfg.get("ui_language", "ru") == "en" else _t("lang_russian", ui_lang),
-                        label=_t("ui_language", ui_lang),
-                    )
                     save_general_btn = gr.Button(_t("save", ui_lang), variant="primary")
                     general_status = gr.HTML(value=f'<span style="color:#9C988B">{_t("not_saved", ui_lang)}</span>')
 
-                    def _save_general(cleanup, ui_lang_val):
+                    def _save_general(cleanup):
                         cfg_k = user_config.load()
                         cfg_k["auto_cleanup"] = cleanup
-                        cfg_k["ui_language"] = "en" if ui_lang_val and "English" in ui_lang_val else "ru"
                         user_config.save(cfg_k)
-                        lang_for_msg = cfg_k["ui_language"]
-                        return f'<span style="color:green">{_t("restart_for_lang", lang_for_msg)}</span>'
+                        return f'<span style="color:green">{_t("saved_sub_ok", "en")}</span>'
                     save_general_btn.click(fn=_save_general,
-                        inputs=[auto_cleanup_cb, ui_lang_radio],
+                        inputs=[auto_cleanup_cb],
                         outputs=[general_status])
 
-            def _lang_for_keys():
-                cfg_k = user_config.load()
-                return cfg_k.get("ui_language", "ru")
-
-            def save_gemini_key(key: str):
-                cfg_k = user_config.load()
-                cfg_k["api_key"] = key
-                cfg_k["llm_provider"] = "gemini"
-                user_config.save(cfg_k)
-                import config as cfg_runtime
-                cfg_runtime.GEMINI_API_KEY = key
-                cfg_runtime.LLM_PROVIDER = "gemini"
-                lk = _lang_for_keys()
-                result = check_api_key(key, "gemini")
-                if result.get("ok"):
-                    return _t("key_saved", lk).format(provider="Google AI")
-                return _t("key_saved_check", lk).format(error=result.get('error', _t("status_unknown", lk)))
-
-            def verify_gemini_key(key: str):
-                lk = _lang_for_keys()
-                result = check_api_key(key, "gemini")
+            def verify_local_model():
+                result = check_ollama()
                 if result["ok"]:
-                    return f'<span style="color:green">{_t("api_ok", lk)}</span>'
-                error = result.get("error", _t("status_unknown", lk))
-                if any(x in error.lower() for x in ["лимит", "quota", "429", "запрещён", "limit", "forbidden"]):
-                    return f'<span style="color:#FF8C00">{_t("key_valid_quota", lk).format(error=error)}</span>'
+                    return f'<span style="color:green">{_t("api_ok", "en")}</span>'
+                error = result.get("error", _t("status_unknown", "en"))
                 return f'<span style="color:red">❌ {error}</span>'
 
-            def save_yandex_key(key: str, folder_id: str, model: str):
-                cfg_k = user_config.load()
-                cfg_k["yandex_api_key"] = key
-                cfg_k["yandex_folder_id"] = folder_id
-                cfg_k["yandex_model"] = model
-                cfg_k["llm_provider"] = "yandex"
-                user_config.save(cfg_k)
-                import config as cfg_runtime
-                cfg_runtime.YANDEX_API_KEY = key
-                cfg_runtime.YANDEX_FOLDER_ID = folder_id
-                cfg_runtime.YANDEX_MODEL = model
-                cfg_runtime.LLM_PROVIDER = "yandex"
-                lk = _lang_for_keys()
-                result = check_api_key(key, "yandex")
-                if result.get("ok"):
-                    return _t("key_saved", lk).format(provider="Yandex AI")
-                return _t("key_saved_check", lk).format(error=result.get('error', _t("status_unknown", lk)))
-
-            def verify_yandex_key(key: str):
-                lk = _lang_for_keys()
-                result = check_api_key(key, "yandex")
-                if result["ok"]:
-                    return f'<span style="color:green">{_t("api_ok", lk)}</span>'
-                error = result.get("error", _t("status_unknown", lk))
-                return f'<span style="color:red">❌ {error}</span>'
-
-            def verify_openrouter_key(key: str):
-                lk = _lang_for_keys()
-                result = check_api_key(key, provider="openrouter")
-                if result["ok"]:
-                    return f'<span style="color:green">{_t("api_ok", lk)}</span>'
-                error = result.get("error", _t("status_unknown", lk))
-                return f'<span style="color:red">❌ {error}</span>'
-
-            def save_openrouter_key(key: str, model: str):
-                cfg_k = user_config.load()
-                cfg_k["openrouter_api_key"] = key
-                cfg_k["openrouter_model"] = model
-                cfg_k["llm_provider"] = "openrouter"
-                user_config.save(cfg_k)
-                import config as cfg_runtime
-                cfg_runtime.OPENROUTER_API_KEY = key
-                cfg_runtime.OPENROUTER_MODEL = model
-                cfg_runtime.LLM_PROVIDER = "openrouter"
-                lk = _lang_for_keys()
-                return _t("key_saved", lk).format(provider="OpenRouter")
-
-            def verify_opencode_zen_key(key: str):
-                lk = _lang_for_keys()
-                result = check_api_key(key, provider="opencode_zen")
-                if result["ok"]:
-                    return f'<span style="color:green">{_t("api_ok", lk)}</span>'
-                error = result.get("error", _t("status_unknown", lk))
-                return f'<span style="color:red">❌ {error}</span>'
-
-            def save_opencode_zen_key(key: str, model: str):
-                cfg_k = user_config.load()
-                cfg_k["opencode_zen_api_key"] = key
-                cfg_k["opencode_zen_model"] = model
-                cfg_k["llm_provider"] = "opencode_zen"
-                user_config.save(cfg_k)
-                import config as cfg_runtime
-                cfg_runtime.OPENCODE_ZEN_API_KEY = key
-                cfg_runtime.OPENCODE_ZEN_MODEL = model
-                cfg_runtime.LLM_PROVIDER = "opencode_zen"
-                lk = _lang_for_keys()
-                return _t("key_saved", lk).format(provider="OpenCode Zen")
-
-
-            save_gemini_btn.click(fn=save_gemini_key, inputs=[gemini_key_box], outputs=[])
-            check_gemini_btn.click(fn=verify_gemini_key, inputs=[gemini_key_box], outputs=[gemini_status])
-            save_yandex_btn.click(fn=save_yandex_key, inputs=[yandex_key_box, yandex_folder_box, yandex_model_dropdown], outputs=[])
-            check_yandex_btn.click(fn=verify_yandex_key, inputs=[yandex_key_box], outputs=[yandex_status])
-            save_openrouter_btn.click(fn=save_openrouter_key, inputs=[openrouter_key_box, openrouter_model_dropdown], outputs=[])
-            check_openrouter_btn.click(fn=verify_openrouter_key, inputs=[openrouter_key_box], outputs=[openrouter_status])
-            save_opencode_zen_btn.click(fn=save_opencode_zen_key, inputs=[opencode_zen_key_box, opencode_zen_model_dropdown], outputs=[])
-            check_opencode_zen_btn.click(fn=verify_opencode_zen_key, inputs=[opencode_zen_key_box], outputs=[opencode_zen_status])
-
-            # Load keys into runtime config on startup (without verifying)
-            if cfg.get("api_key"):
-                import config as cfg_runtime
-                cfg_runtime.GEMINI_API_KEY = cfg["api_key"]
-            if cfg.get("yandex_api_key"):
-                import config as cfg_runtime
-                cfg_runtime.YANDEX_API_KEY = cfg["yandex_api_key"]
-                cfg_runtime.YANDEX_FOLDER_ID = cfg.get("yandex_folder_id", "")
-                cfg_runtime.YANDEX_MODEL = cfg.get("yandex_model", "yandexgpt-lite")
-            if cfg.get("openrouter_api_key"):
-                import config as cfg_runtime
-                cfg_runtime.OPENROUTER_API_KEY = cfg["openrouter_api_key"]
-                cfg_runtime.OPENROUTER_MODEL = cfg.get(
-                    "openrouter_model", getattr(cfg_runtime, "OPENROUTER_MODEL", "")
-                )
-            if cfg.get("opencode_zen_api_key"):
-                import config as cfg_runtime
-                cfg_runtime.OPENCODE_ZEN_API_KEY = cfg["opencode_zen_api_key"]
-                cfg_runtime.OPENCODE_ZEN_MODEL = cfg.get(
-                    "opencode_zen_model", getattr(cfg_runtime, "OPENCODE_ZEN_MODEL", "")
-                )
+            check_local_model_btn.click(fn=verify_local_model, inputs=[], outputs=[local_model_status])
 
     return app
 

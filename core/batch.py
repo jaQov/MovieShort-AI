@@ -15,7 +15,11 @@ from utils import get_video_basename
 
 
 # credits/music filter — R7b-6
-_CREDITS_RE = re.compile(r'редактор|корректор|субтитров|телефон', re.I)
+_CREDITS_RE = re.compile(
+    r'subtitles? by|subs? by|synced? by|sync and correct|translat(ed|ion) by|'
+    r'proofread|encoded by|www\.|\.com',
+    re.I,
+)
 
 
 def _is_credit_or_silent(block):
@@ -35,7 +39,7 @@ def _resolve_movie_title(settings, video_path):
     raw = (settings.get("movie_title") or "").strip()
     title = raw or Path(video_path).stem
     if not raw:
-        print(f"⚠ Точное название фильма не задано — в анализ передано имя файла «{title}». Укажите название для лучшего качества.")
+        print(f"⚠ Exact movie title not set — using filename «{title}» for analysis. Set a title for better results.")
     return title
 
 
@@ -50,8 +54,7 @@ def process_movie(video_path, settings=None):
             - min_duration (int): min clip length in seconds (default 15)
             - subtitles (bool): enable subtitles (default True)
             - face_tracking (bool): enable face tracking (default True)
-            - api_key (str): API key
-            - film_language (str): 'ru' or 'en'
+            - subtitle_path (str): external subtitle file (required)
             - anti_copyright (bool): enable anti-copyright measures
             - blur_background (bool): enable blurred background
             - banner_top (int): top banner padding
@@ -70,8 +73,6 @@ def process_movie(video_path, settings=None):
     min_duration = settings.get("min_duration", config.DEFAULT_MIN_CLIP_DURATION)
     subtitles = settings.get("subtitles", True)
     face_tracking = settings.get("face_tracking", True)
-    api_key = settings.get("api_key", config.GEMINI_API_KEY)
-    film_language = settings.get("film_language", "ru")
 
     video_path = str(video_path)
     movie_title = _resolve_movie_title(settings, video_path)
@@ -83,7 +84,7 @@ def process_movie(video_path, settings=None):
     os.makedirs(movie_output, exist_ok=True)
 
     print(f"Processing movie: {os.path.basename(video_path)}")
-    print(f"Options: subtitles={subtitles}, face_tracking={face_tracking}, language={film_language}")
+    print(f"Options: subtitles={subtitles}, face_tracking={face_tracking}")
     print()
 
     subtitle_path = find_external_subtitle(
@@ -97,35 +98,21 @@ def process_movie(video_path, settings=None):
         return []
     print(f"Using subtitles: {os.path.basename(subtitle_path)}")
 
-    # Check settings
-    analysis_mode = settings.get("analysis_mode", "context")
-    llm_provider = settings.get("llm_provider", "gemini")
-
     # Step 1: Find best clips
     print("=" * 50)
     print("STEP 1: Finding best scenes...")
     print("=" * 50)
 
-    best_scenes = None
-
-    # Context mode: LLM sees real scene transcripts, picks by number
-    if analysis_mode == "context" and movie_title and api_key:
-        print(f"  Режим: контекстный ({llm_provider})")
-        print("  → Context mode: LLM видит текст сцен, выбирает по номерам")
-        best_scenes = find_best_clips_context(
-            video_path, movie_title, api_key, llm_provider,
-            max_duration, min_duration,
-            num_clips=settings.get("num_clips", config.DEFAULT_NUM_CLIPS),
-            score_threshold=settings.get("score_threshold", 7.0),
-            language=film_language,
-            subtitle_path=subtitle_path,
-        )
-        if best_scenes is None:
-            print("❌ Subtitle-based AI analysis failed.")
-            print("Stopping.")
-            return []
-    else:
-        print("❌ The automatic pipeline requires context-based AI analysis.")
+    print("  Mode: context (local Ollama model sees scene text, picks by number)")
+    best_scenes = find_best_clips_context(
+        video_path, movie_title,
+        max_duration, min_duration,
+        num_clips=settings.get("num_clips", config.DEFAULT_NUM_CLIPS),
+        score_threshold=settings.get("score_threshold", 7.0),
+        subtitle_path=subtitle_path,
+    )
+    if best_scenes is None:
+        print("❌ Subtitle-based AI analysis failed.")
         print("Stopping.")
         return []
 
@@ -188,8 +175,8 @@ def process_movie(video_path, settings=None):
                 orig_end_fmt = _format_time(scene_end)
                 scene_start, scene_end = new_start, new_end
                 scene_dur = scene_end - scene_start
-                print(f"  🎯 Сцена {orig_start_fmt}-{orig_end_fmt} ({scene_dur:.0f}s): "
-                      f"центрирован на диалоге → {_format_time(scene_start)}-{_format_time(scene_end)}")
+                print(f"  🎯 Scene {orig_start_fmt}-{orig_end_fmt} ({scene_dur:.0f}s): "
+                      f"centered on dialogue → {_format_time(scene_start)}-{_format_time(scene_end)}")
 
         timestamps.append((_format_time(scene_start), _format_time(scene_end)))
         titles.append(title)
@@ -247,7 +234,7 @@ def process_movie(video_path, settings=None):
             ).stdout.strip()
             dur_min = float(dur_str) / 60 if dur_str else 0
             est_cost = dur_min * cpm
-            print(f"💰 Стоимость: ~{est_cost:.2f} руб ({cpm:.2f} руб/мин × {dur_min:.1f} мин)")
+            print(f"💰 Cost: ~{est_cost:.2f} ({cpm:.2f}/min × {dur_min:.1f} min)")
     except Exception:
         pass
 
@@ -281,7 +268,7 @@ def cleanup_temp_dir():
                     shutil.rmtree(fp)
             except Exception:
                 pass
-        print("  🧹 Временные файлы удалены")
+        print("  🧹 Temp files removed")
 
 
 def _format_time(seconds):
@@ -375,16 +362,16 @@ def _validate_sub_clips(sub_clips, block_start, block_end, block_duration):
         sc_reason = sc.get("reason", "")
 
         if sc_start < 0 or sc_end > block_end:
-            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — вне границ блока")
+            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — outside block bounds")
             continue
-        if sc_dur < 20 and sc_reason not in ("самодостаточен", "self_contained"):
-            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — слишком короткий ({sc_dur:.0f}s)")
+        if sc_dur < 20 and sc_reason != "self_contained":
+            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — too short ({sc_dur:.0f}s)")
             continue
         if sc_dur > 75:
-            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — слишком длинный ({sc_dur:.0f}s)")
+            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — too long ({sc_dur:.0f}s)")
             continue
         if sc_score < 1 or sc_score > 10:
-            print(f"  ⛔ «{sc_title}» — неверная оценка {sc_score}")
+            print(f"  ⛔ «{sc_title}» — invalid score {sc_score}")
             continue
 
         valid.append({
@@ -491,15 +478,14 @@ def _batch_size_for_model(model):
 
 def _max_prompt_chars(model):
     """Prompt char budget: context tokens * chars/token estimate * input share."""
-    merged = {**config.MODEL_CONTEXT_TOKENS, **getattr(config, 'OPENCODE_ZEN_MODEL_CONTEXT_TOKENS', {})}
-    ctx = merged.get(model, config.DEFAULT_CONTEXT_TOKENS)
+    ctx = config.MODEL_CONTEXT_TOKENS.get(model, config.DEFAULT_CONTEXT_TOKENS)
     return int(ctx * config.PROMPT_CHARS_PER_TOKEN * config.PROMPT_INPUT_BUDGET)
 
 
 def _prompt_content_chars(batch_blocks):
     """Estimated prompt chars contributed by a batch's blocks (framing + dialogue)."""
     return sum(
-        _BLOCK_FRAMING_CHARS + len(b.get("text", "").strip() or "(нет диалога)")
+        _BLOCK_FRAMING_CHARS + len(b.get("text", "").strip() or "(no dialogue)")
         for b in batch_blocks
     )
 
@@ -509,7 +495,7 @@ def _truncate_batch(chunk, content_budget):
 
     Returns shallow copies — input blocks are never mutated. Floor 200 chars wins.
     """
-    dialogues = [b.get("text", "").strip() or "(нет диалога)" for b in chunk]
+    dialogues = [b.get("text", "").strip() or "(no dialogue)" for b in chunk]
     dialogue_total = sum(len(d) for d in dialogues)
     fixed = _prompt_content_chars(chunk) - dialogue_total
     available = content_budget - fixed
@@ -545,26 +531,24 @@ def _split_batches(blocks, batch_size, content_budget):
     return batches
 
 
-def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
+def find_best_clips_context(video_path, movie_title,
                             max_duration=60, min_duration=15,
-                            num_clips=10, score_threshold=7.0, language="ru",
+                            num_clips=10, score_threshold=7.0,
                             subtitle_path=None):
-    """Context mode: detect blocks → LLM splits each block into sub-clips.
+    """Context mode: detect blocks → local LLM splits each block into sub-clips.
 
     Each block from detect_and_transcribe() carries metadata:
-    pause_points, cut_count, audio_peaks. LLM decides boundaries and titles
-    per block in one call. Falls back to smart centering when LLM returns empty.
+    pause_points, cut_count, audio_peaks. The LLM decides boundaries and
+    titles per block in one call. Falls back to smart centering when the
+    LLM returns empty.
 
     Args:
         video_path: path to video file
         movie_title: movie name for LLM context
-        api_key: API key
-        provider: 'gemini' or 'yandex'
         max_duration: max clip length in seconds
         min_duration: min clip length in seconds
         num_clips: max number of clips to return (default 10)
         score_threshold: minimum score (default 7.0)
-        language: 'ru' or 'en' for prompts
         subtitle_path: required external subtitle file used for analysis
 
     Returns list of {start, end, duration, text, score, title} or None.
@@ -573,7 +557,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
     from pathlib import Path
 
     from analyzers.scene_analyzer import detect_and_transcribe
-    from analyzers.text_analyzer import PROMPT_BATCH_TO_CLIPS, PROMPT_BATCH_TO_CLIPS_EN, _parse_batch_response
+    from analyzers.text_analyzer import PROMPT_BATCH_TO_CLIPS, _parse_batch_response
 
     video_basename = Path(video_path).stem
     total_start = time.time()
@@ -583,7 +567,6 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
     print("[Context] Detecting scenes and loading subtitles...")
     blocks = detect_and_transcribe(
         video_path,
-        language=language,
         subtitle_path=subtitle_path,
     )
 
@@ -612,16 +595,9 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
         print("  No blocks with dialogue — nothing to process")
         return None
 
-    if provider == "yandex":
-        model = config.YANDEX_MODEL
-    elif provider == "openrouter":
-        model = getattr(config, 'OPENROUTER_MODEL', '')
-    elif provider == "opencode_zen":
-        model = getattr(config, 'OPENCODE_ZEN_MODEL', '')
-    else:
-        model = config.LLM_MODEL
+    model = config.LLM_MODEL
     batch_size = _batch_size_for_model(model)
-    batch_template = PROMPT_BATCH_TO_CLIPS if language == "ru" else PROMPT_BATCH_TO_CLIPS_EN
+    batch_template = PROMPT_BATCH_TO_CLIPS
     all_sub_clips = []
     batches = _split_batches(blocks, batch_size,
                              _max_prompt_chars(model) - len(batch_template))
@@ -642,7 +618,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
             block_start = block["start"]
             block_end = block["end"]
             block_dur = block_end - block_start
-            dialogue = block.get("text", "").strip() or "(нет диалога)"
+            dialogue = block.get("text", "").strip() or "(no dialogue)"
             cut_count = block.get("cut_count", 0)
             pause_points = block.get("pause_points", [])
 
@@ -651,20 +627,12 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
             print(f"    Dialogue: {dialogue_preview}")
             print(f"    Cuts: {cut_count}, Pauses: {len(pause_points)}")
 
-            if language == "ru":
-                block_texts.append(
-                    f"--- БЛОК {i} ({_format_time(block_start)}-{_format_time(block_end)}, {block_dur:.0f}s) ---\n"
-                    f"Диалог: {dialogue}\n"
-                    f"Смен кадра: {cut_count} (высокое = экшн)\n"
-                    f"Паузы в диалоге: {pause_points}"
-                )
-            else:
-                block_texts.append(
-                    f"--- BLOCK {i} ({_format_time(block_start)}-{_format_time(block_end)}, {block_dur:.0f}s) ---\n"
-                    f"Dialogue: {dialogue}\n"
-                    f"Cut count: {cut_count} (high = action)\n"
-                    f"Dialogue pauses: {pause_points}"
-                )
+            block_texts.append(
+                f"--- BLOCK {i} ({_format_time(block_start)}-{_format_time(block_end)}, {block_dur:.0f}s) ---\n"
+                f"Dialogue: {dialogue}\n"
+                f"Cut count: {cut_count} (high = action)\n"
+                f"Dialogue pauses: {pause_points}"
+            )
 
         blocks_text = "\n\n".join(block_texts)
         prompt = batch_template.format(
@@ -679,7 +647,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
         # Call LLM once for the entire batch
         raw_response = None
         try:
-            raw_response = call_llm(prompt, api_key, provider, max_tokens=_max_tokens_for(len(batch_blocks)))
+            raw_response = call_llm(prompt, max_tokens=_max_tokens_for(len(batch_blocks)))
         except Exception as e:
             print(f"  ⚠️ Batch {batch_num} LLM failed: {e}")
 
@@ -713,27 +681,19 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
                     sb_start = sb["start"]
                     sb_end = sb["end"]
                     sb_dur = sb_end - sb_start
-                    dlg = sb.get("text", "").strip() or "(нет диалога)"
+                    dlg = sb.get("text", "").strip() or "(no dialogue)"
                     cc = sb.get("cut_count", 0)
                     pp = sb.get("pause_points", [])
-                    if language == "ru":
-                        sub_texts.append(
-                            f"--- БЛОК {j} ({_format_time(sb_start)}-{_format_time(sb_end)}, {sb_dur:.0f}s) ---\n"
-                            f"Диалог: {dlg}\n"
-                            f"Смен кадра: {cc} (высокое = экшн)\n"
-                            f"Паузы в диалоге: {pp}"
-                        )
-                    else:
-                        sub_texts.append(
-                            f"--- BLOCK {j} ({_format_time(sb_start)}-{_format_time(sb_end)}, {sb_dur:.0f}s) ---\n"
-                            f"Dialogue: {dlg}\n"
-                            f"Cut count: {cc} (high = action)\n"
-                            f"Dialogue pauses: {pp}"
-                        )
+                    sub_texts.append(
+                        f"--- BLOCK {j} ({_format_time(sb_start)}-{_format_time(sb_end)}, {sb_dur:.0f}s) ---\n"
+                        f"Dialogue: {dlg}\n"
+                        f"Cut count: {cc} (high = action)\n"
+                        f"Dialogue pauses: {pp}"
+                    )
                 sub_prompt = batch_template.format(movie_name=movie_title, blocks_text="\n\n".join(sub_texts))
                 sub_raw = None
                 try:
-                    sub_raw = call_llm(sub_prompt, api_key, provider, max_tokens=_max_tokens_for(len(sub_blocks)))
+                    sub_raw = call_llm(sub_prompt, max_tokens=_max_tokens_for(len(sub_blocks)))
                 except Exception as e:
                     print(f"  ⚠️ Split sub-batch (offset {offset}, size {len(sub_blocks)}) failed: {e}")
                     sub_raw = None
@@ -786,7 +746,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
                         reasons = []
                         if sc_start < block_start or sc_end > block_end:
                             reasons.append("out_of_bounds")
-                        if sc_dur < 20 and sc_reason not in ("самодостаточен", "self_contained"):
+                        if sc_dur < 20 and sc_reason != "self_contained":
                             reasons.append(f"too_short({sc_dur:.0f}s)")
                         if sc_dur > 75:
                             reasons.append(f"too_long({sc_dur:.0f}s)")
@@ -867,7 +827,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
             if curr["start"] < mid:
                 curr["start"] = mid
                 curr["duration"] = curr["end"] - curr["start"]
-            print(f"  Перекрытие разрешено: разрез по {_format_time(mid)}")
+            print(f"  Overlap resolved: cut at {_format_time(mid)}")
 
     elapsed = time.time() - total_start
     print(f"\n✓ {len(filtered)} clip(s) selected in {elapsed:.0f}s")
@@ -940,10 +900,10 @@ def _deduplicate_clips(clips, min_gap=120.0):
         if gap < min_gap:
             if clip["score"] > kept[-1]["score"]:
                 removed = kept.pop()
-                print(f"🗑️ Клип «{removed.get('title','')}» удалён (дубликат {clip.get('title','')}, дистанция {gap:.0f}s)")
+                print(f"🗑️ Clip «{removed.get('title','')}» removed (duplicate of {clip.get('title','')}, {gap:.0f}s apart)")
                 kept.append(clip)
             else:
-                print(f"🗑️ Клип «{clip.get('title','')}» удалён (дубликат {kept[-1].get('title','')}, дистанция {gap:.0f}s)")
+                print(f"🗑️ Clip «{clip.get('title','')}» removed (duplicate of {kept[-1].get('title','')}, {gap:.0f}s apart)")
         else:
             kept.append(clip)
     return kept

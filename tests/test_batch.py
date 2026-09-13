@@ -179,7 +179,7 @@ def test_resolve_movie_title_empty_warns_with_stem(capsys):
     title = _resolve_movie_title({"movie_title": ""}, "D:/Movies/Inception.2010.1080p.mkv")
     assert title == "Inception.2010.1080p"
     out = capsys.readouterr().out
-    assert "Точное название фильма не задано" in out
+    assert "Exact movie title not set" in out
     assert "Inception.2010.1080p" in out
 
 
@@ -188,15 +188,15 @@ def test_resolve_movie_title_missing_key_warns(capsys):
     title = _resolve_movie_title({}, "D:/Movies/SomeFilm.mp4")
     assert title == "SomeFilm"
     out = capsys.readouterr().out
-    assert "Точное название фильма не задано" in out
+    assert "Exact movie title not set" in out
     assert "SomeFilm" in out
 
 
 def test_resolve_movie_title_given_no_warning(capsys):
     """Non-empty movie_title → returned as-is, no warning."""
-    title = _resolve_movie_title({"movie_title": "Начало"}, "D:/Movies/Inception.mkv")
-    assert title == "Начало"
-    assert "Точное название фильма не задано" not in capsys.readouterr().out
+    title = _resolve_movie_title({"movie_title": "Inception"}, "D:/Movies/Inception.mkv")
+    assert title == "Inception"
+    assert "Exact movie title not set" not in capsys.readouterr().out
 
 
 # --- T5: model-aware batch sizing + prompt budget guard ---
@@ -224,7 +224,7 @@ def test_max_prompt_chars_deepseek():
 def test_normal_blocks_keep_batch_8():
     """24 small blocks + deepseek limit → six batches of exactly 4, no truncation."""
     blocks = [
-        {"start": i * 120, "end": (i + 1) * 120, "text": "Короткий диалог." * 10}
+        {"start": i * 120, "end": (i + 1) * 120, "text": "Short dialogue." * 10}
         for i in range(24)
     ]
     limit = _max_prompt_chars("deepseek-v4-flash")
@@ -237,7 +237,7 @@ def test_normal_blocks_keep_batch_8():
 
 def test_oversized_dialogues_fit_limit():
     """12 huge-dialogue blocks + unknown model (32K default) → every batch fits, dialogues truncated, 200-char floor."""
-    big = "слово " * 10000  # 60_000 chars per dialogue
+    big = "words " * 10000  # 60_000 chars per dialogue
     blocks = [
         {"start": i * 120, "end": (i + 1) * 120, "text": big}
         for i in range(12)

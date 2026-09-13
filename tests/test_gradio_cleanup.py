@@ -1,4 +1,4 @@
-"""T14 — автоочистка Gradio Temp."""
+"""T14 — automatic Gradio Temp cleanup."""
 import os
 import sys
 import types
@@ -97,7 +97,7 @@ def _load_helpers():
 
 
 def test_gradio_after_process_unlink(tmp_path, monkeypatch):
-    """Мок file.name в Temp\\gradio, вызов должен unlink."""
+    """Mock file.name in Temp\\gradio, the call should unlink it."""
     _try_remove_gradio_temp, _is_gradio_temp_path, _ = _load_helpers()
 
     gradio_dir = os.path.join(tempfile.gettempdir(), "gradio")
@@ -120,7 +120,7 @@ def test_gradio_after_process_unlink(tmp_path, monkeypatch):
     # also via helper
     if os.path.exists(fake):
         _try_remove_gradio_temp(fake)
-    assert not os.path.exists(fake), "Gradio temp должен быть удалён после обработки"
+    assert not os.path.exists(fake), "Gradio temp file should be removed after processing"
 
     # Negative: source outside Temp/gradio must NOT be deleted
     outside = tmp_path / "outside.mp4"
@@ -128,7 +128,7 @@ def test_gradio_after_process_unlink(tmp_path, monkeypatch):
     p2 = str(outside)
     # helper must NOT delete because no gradio/Temp
     _try_remove_gradio_temp(p2)
-    assert outside.exists(), "Исходник вне Temp/gradio не должен удаляться"
+    assert outside.exists(), "Source outside Temp/gradio must not be deleted"
     # ensure condition false
     assert not _is_gradio_temp_path(p2)
 
@@ -143,7 +143,7 @@ def test_gradio_after_process_unlink(tmp_path, monkeypatch):
 
 
 def test_gradio_startup_old_removed(monkeypatch):
-    """Создать Temp\\gradio\\old_file с mtime -25h, вызвать startup cleanup, assert удалён."""
+    """Create Temp\\gradio\\old_file with mtime -25h, run startup cleanup, assert it's removed."""
     gradio_tmp = os.path.join(tempfile.gettempdir(), "gradio")
     os.makedirs(gradio_tmp, exist_ok=True)
 
@@ -169,8 +169,8 @@ def test_gradio_startup_old_removed(monkeypatch):
         except Exception:
             pass
 
-    assert not os.path.exists(old_file), "Старый файл (>24ч) должен быть удалён стартап-чисткой"
-    assert os.path.exists(new_file), "Новый файл не должен удаляться"
+    assert not os.path.exists(old_file), "Old file (>24h) should be removed by startup cleanup"
+    assert os.path.exists(new_file), "New file should not be removed"
     try:
         os.unlink(new_file)
     except Exception:

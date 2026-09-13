@@ -24,7 +24,7 @@ from gui.app import create_app
 
 
 def cleanup_gradio_temp_startup():
-    """Стартап-чистка Temp/gradio старше 24ч (T14)."""
+    """Startup cleanup of Temp/gradio files older than 24h (T14)."""
     try:
         import tempfile
         import os
@@ -47,7 +47,7 @@ def cleanup_gradio_temp_startup():
                 except Exception:
                     pass
             if removed:
-                print(f"\U0001f9f9 Gradio temp: удалено {removed} старых файлов")
+                print(f"\U0001f9f9 Gradio temp: removed {removed} old file(s)")
             return removed
     except Exception:
         pass
@@ -56,12 +56,12 @@ def cleanup_gradio_temp_startup():
 
 def main():
     """Launch the MovieShort AI Gradio interface."""
-    # T14 стартап-чистка
+    # T14 startup cleanup
     try:
         cleanup_gradio_temp_startup()
     except Exception:
         pass
-    # также пробуем вызвать из gui.app если там есть
+    # also try calling the gui.app copy, if present
     try:
         from gui.app import cleanup_gradio_temp as _gui_cleanup
         _gui_cleanup()
@@ -69,7 +69,7 @@ def main():
         pass
     print(f"[MovieShort AI] starting on http://localhost:{config.GRADIO_PORT}")
     print(f"   Output directory: {config.OUTPUT_DIR}")
-    print(f"   Language: Russian / English (select in Auto mode -> Film language)")
+    print(f"   Local model: Ollama / {config.OLLAMA_MODEL} (English movies)")
 
     app = create_app()
     app.launch(

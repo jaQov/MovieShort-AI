@@ -103,7 +103,7 @@ def _sanitize_name_part(value):
 def _build_clip_name(movie_title, clip_title, start_time, video_path):
     """YouTube-Shorts style output filename (no extension).
 
-    Format: 'Момент из фильма {movie_clean} ({year}), {clip}'.
+    Format: 'Moment from {movie_clean} ({year}), {clip}'.
     Year is regex-extracted from movie_title and cut out of the clean title;
     no year part when movie_title has none. Falls back to the timestamp-based
     '{stem}_{start}' name when clip_title sanitizes to empty.
@@ -115,7 +115,7 @@ def _build_clip_name(movie_title, clip_title, start_time, video_path):
         return f"{Path(video_path).stem}_{safe_start}"
 
     movie_title = str(movie_title or "").strip()
-    # strip empty parens like "Тор ( )" -> "Тор"
+    # strip empty parens like "Inception ( )" -> "Inception"
     movie_title = re.sub(r"\(\s*\)", "", movie_title).strip()
     movie_title = re.sub(r"\s+", " ", movie_title).strip()
     match = re.search(r"(19\d\d|20\d\d)", movie_title)
@@ -130,7 +130,7 @@ def _build_clip_name(movie_title, clip_title, start_time, video_path):
         movie_part = _sanitize_name_part(clean_title)
 
     if movie_part:
-        name = f"Момент из фильма {movie_part}, {clip_clean}"
+        name = f"Moment from {movie_part}, {clip_clean}"
     else:
         name = clip_clean
     return name[:200].strip()
