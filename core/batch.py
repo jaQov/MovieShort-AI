@@ -8,10 +8,9 @@ import shutil
 from pathlib import Path
 
 import config
-from analyzers.detector import find_best_clips_standard
 from analyzers.text_analyzer import call_llm
 from core.pipeline import process_multiple
-from core.subtitle import load_segments_json
+from core.subtitle import find_external_subtitle, load_segments_json
 from utils import get_video_basename
 
 
@@ -87,6 +86,17 @@ def process_movie(video_path, settings=None):
     print(f"Options: subtitles={subtitles}, face_tracking={face_tracking}, language={film_language}")
     print()
 
+    subtitle_path = find_external_subtitle(
+        video_path,
+        explicit_path=settings.get("subtitle_path"),
+    )
+    if not subtitle_path:
+        print("❌ Missing subtitles: no subtitle file found.")
+        print("   Supported formats: .srt, .ass, .ssa, .vtt")
+        print("Stopping.")
+        return []
+    print(f"Using subtitles: {os.path.basename(subtitle_path)}")
+
     # Check settings
     analysis_mode = settings.get("analysis_mode", "context")
     llm_provider = settings.get("llm_provider", "gemini")
@@ -108,20 +118,16 @@ def process_movie(video_path, settings=None):
             num_clips=settings.get("num_clips", config.DEFAULT_NUM_CLIPS),
             score_threshold=settings.get("score_threshold", 7.0),
             language=film_language,
+            subtitle_path=subtitle_path,
         )
         if best_scenes is None:
-            print("  Context mode failed, falling back to standard mode...")
-
-    # Standard mode: NO LLM, random selection
-    if best_scenes is None:
-        print("  Режим: стандартный")
-        print("  → Standard mode: без LLM, названия не генерируются")
-        best_scenes = find_best_clips_standard(
-            video_path,
-            max_duration=max_duration,
-            min_duration=min_duration,
-            num_clips=settings.get("num_clips", config.DEFAULT_NUM_CLIPS),
-        )
+            print("❌ Subtitle-based AI analysis failed.")
+            print("Stopping.")
+            return []
+    else:
+        print("❌ The automatic pipeline requires context-based AI analysis.")
+        print("Stopping.")
+        return []
 
     if movie_title:
         print(f"  Movie: {movie_title}")
@@ -135,16 +141,25 @@ def process_movie(video_path, settings=None):
     print(f"STEP 2: Processing {len(best_scenes)} clips...")
     print("=" * 50)
 
-    # Find pre-transcribed transcript JSON — match by video+language+model hash
+    # Find the external-subtitle transcript JSON generated during analysis.
     import hashlib
     transcript_json = None
     video_basename = get_video_basename(video_path)
-    hash_input = f"{video_path}_{film_language}_{config.WHISPER_MODEL}"
+    hash_input = (
+        f"{video_path}_"
+        f"{subtitle_path}_"
+        f"{os.path.getmtime(subtitle_path)}"
+    )
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
     expected = str(config.CACHE_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
     if os.path.exists(expected):
         transcript_json = expected
-        print(f"Found pre-transcribed transcript: full_transcript_{video_basename}_{file_hash}.json")
+        print(f"Found subtitle transcript: full_transcript_{video_basename}_{file_hash}.json")
+
+    if not transcript_json:
+        print("❌ Missing subtitles: the external subtitle transcript cache was not created.")
+        print("Stopping.")
+        return []
 
     # Pre-load transcript segments for smart clip centering
     clip_segments = None
@@ -189,13 +204,13 @@ def process_movie(video_path, settings=None):
         "blur_background": settings.get("blur_background", config.DEFAULT_BLUR_BACKGROUND),
         "banner_top": settings.get("banner_top", config.DEFAULT_BANNER_TOP),
         "banner_bottom": settings.get("banner_bottom", config.DEFAULT_BANNER_BOTTOM),
+        "subtitle_path": subtitle_path,
     }
     # R7b-7: Editor subtitle style flows to final clips (same font_style path as render_full_preview)
     for _k in ("subtitle_font", "subtitle_font_name", "subtitle_size", "subtitle_outline", "subtitle_color", "subtitle_bold", "subtitle_italic", "subtitle_shadow", "subtitle_position_y", "font_style"):
         if _k in settings and settings[_k] is not None:
             base_options[_k] = settings[_k]
-    if transcript_json:
-        base_options["transcript_path"] = transcript_json
+    base_options["transcript_path"] = transcript_json
 
     results = process_multiple(video_path, timestamps, base_options, titles=titles, max_workers=2)
 
@@ -282,7 +297,7 @@ def _snap_scene_boundary(clip_segments, scene_start, scene_end, max_dur):
 
     Priority:
     1. Sentence end (. ! ?) in [max_dur-3, max_dur+5]
-    2. Pause in dialogue >0.8s between whisper segments
+    2. Pause in dialogue >0.8s between subtitle segments
     3. Word boundary (fallback)
 
     Returns (new_end, extended) where new_end <= scene_end.
@@ -532,7 +547,8 @@ def _split_batches(blocks, batch_size, content_budget):
 
 def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
                             max_duration=60, min_duration=15,
-                            num_clips=10, score_threshold=7.0, language="ru"):
+                            num_clips=10, score_threshold=7.0, language="ru",
+                            subtitle_path=None):
     """Context mode: detect blocks → LLM splits each block into sub-clips.
 
     Each block from detect_and_transcribe() carries metadata:
@@ -548,7 +564,8 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
         min_duration: min clip length in seconds
         num_clips: max number of clips to return (default 10)
         score_threshold: minimum score (default 7.0)
-        language: 'ru' or 'en' for transcription and prompts
+        language: 'ru' or 'en' for prompts
+        subtitle_path: required external subtitle file used for analysis
 
     Returns list of {start, end, duration, text, score, title} or None.
     """
@@ -562,12 +579,16 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
     total_start = time.time()
     print(f"\n🎬 {video_basename}: Context mode — block-based LLM pipeline")
 
-    # Step 1: Detect scenes + transcribe (now returns blocks with metadata)
-    print("[Context] Detecting scenes and transcribing...")
-    blocks = detect_and_transcribe(video_path, language=language)
+    # Step 1: Detect scenes and map the external subtitle file to them.
+    print("[Context] Detecting scenes and loading subtitles...")
+    blocks = detect_and_transcribe(
+        video_path,
+        language=language,
+        subtitle_path=subtitle_path,
+    )
 
     if not blocks:
-        print("  No blocks detected, falling back to standard mode")
+        print("  No subtitle-based blocks detected")
         return None
 
     total_duration = blocks[-1]["end"] if blocks else 0
