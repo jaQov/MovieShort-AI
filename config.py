@@ -31,6 +31,8 @@ BANNER_BOTTOM = 300              # pixels
 
 # Face tracking
 FACE_TRACKING_INTERVAL = 5       # Analyze every Nth frame
+PERSON_SCAN_TIMEOUT_SECONDS = 120  # Give up and center-crop if the per-clip
+                                    # face/person scan takes longer than this
 
 # Scene detection
 SCENE_THRESHOLD = 27.0

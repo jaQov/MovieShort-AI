@@ -905,19 +905,31 @@ def apply_vertical_crop(
     if progress_callback:
         progress_callback(0.05)
 
-    # Person analysis with timeout (30s max) — try cache first
+    # Person analysis with timeout — try cache first.
+    #
+    # IMPORTANT: the pool is NOT used as a context manager here. Exiting a
+    # `with ThreadPoolExecutor(...)` block calls shutdown(wait=True), which
+    # blocks until the submitted task actually finishes — so a naive
+    # `with ... : ... except TimeoutError: return fallback` still pays the
+    # full analysis time before returning, it just discards the result.
+    # shutdown(wait=False) lets us bail out immediately on timeout while the
+    # scan finishes harmlessly in the background (its cache write targets a
+    # temp clip file that gets deleted right after this call anyway).
     person_data = _load_person_cache(video_path)
     if person_data is None:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(analyze_persons, video_path)
-            try:
-                person_data = fut.result(timeout=30)
-            except _CFTimeoutError:
-                print("  ⚠ Person scan timed out (30s) — using fallback")
-                return _center_crop_ffmpeg(video_path, output_path, progress_callback,
-                                           anti_copyright=anti_copyright,
-                                           banner_top=banner_top, banner_bottom=banner_bottom)
+        pool = ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(analyze_persons, video_path)
+        scan_timeout = getattr(config, "PERSON_SCAN_TIMEOUT_SECONDS", 30)
+        try:
+            person_data = fut.result(timeout=scan_timeout)
+            pool.shutdown(wait=False)
+        except _CFTimeoutError:
+            print(f"  ⚠ Person scan timed out ({scan_timeout}s) — using fallback")
+            pool.shutdown(wait=False)
+            return _center_crop_ffmpeg(video_path, output_path, progress_callback,
+                                       anti_copyright=anti_copyright,
+                                       banner_top=banner_top, banner_bottom=banner_bottom)
 
     if progress_callback:
         progress_callback(0.5)
