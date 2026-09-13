@@ -1,256 +1,310 @@
 """
-MovieShort AI — Scene detection and transcription analyzer.
+MovieShort AI — Scene detection and external subtitle analysis.
+
+The automatic movie pipeline uses:
+    1. PySceneDetect for visual scene boundaries.
+    2. External subtitle files for dialogue/action text.
+
+Whisper is intentionally NOT used here.
 """
+
 import hashlib
-import json as _json
-import re
-import time as time_module
-import subprocess
 import os
+import subprocess
+import time as time_module
+from pathlib import Path
 
 from scenedetect import open_video, SceneManager, ContentDetector
 
+import config
 from core.subtitle import (
     find_external_subtitle,
     load_external_subtitles,
     save_segments_json,
 )
-import config
-
-
-def _cleanup_temp_audio(path: str) -> None:
-    """Safely remove temp audio file if it exists."""
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def _compute_audio_rms(video_path: str, audio_path: str) -> list:
-    """Compute RMS envelope (dBFS) from WAV audio, one value per 200ms window.
-
-    Reads the 16-bit PCM WAV directly via Python (no ffmpeg astats dependency),
-    properly parsing RIFF/WAV chunk structure to find the data chunk.
-    Returns list of dBFS values or [] on error.
-    """
-    import struct
-    import math
-    window_s = 0.2   # 200ms per window
-
-    try:
-        with open(audio_path, "rb") as f:
-            buf = f.read()
-    except (IOError, OSError):
-        return []
-
-    if len(buf) < 44:
-        return []
-
-    # Parse RIFF/WAV chunk structure to locate the "data" chunk
-    # WAV format: RIFF header (12 bytes) → chunks (type + size + data)
-    # fmt chunk is usually first, but we skip through all chunks
-    # to find the data chunk (can have LIST, fact, etc. in between)
-    pos = 12  # skip RIFF header (4 RIFF + 4 size + 4 WAVE)
-    sample_rate = 16000  # default fallback
-    data_start = -1
-    data_end = len(buf)
-
-    while pos < min(len(buf), 256):  # scan first 256 bytes for headers
-        if pos + 8 > len(buf):
-            break
-        chunk_id = buf[pos:pos + 4]
-        if len(chunk_id) < 4:
-            break
-        chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
-        chunk_data_start = pos + 8
-
-        if chunk_id == b"fmt ":
-            # fmt chunk: parse sample rate at offset 12 within chunk
-            if chunk_data_start + 16 <= len(buf):
-                sample_rate = struct.unpack_from("<I", buf, chunk_data_start + 4)[0]
-                channels = struct.unpack_from("<H", buf, chunk_data_start + 2)[0]
-        elif chunk_id == b"data":
-            data_start = chunk_data_start
-            data_end = chunk_data_start + chunk_size
-
-        # Move to next chunk (chunks are padded to 2 bytes)
-        pos = chunk_data_start + chunk_size
-        if pos % 2:
-            pos += 1
-
-    if data_start < 0:
-        return []  # no data chunk found
-
-    # Read raw PCM data (16-bit signed little-endian)
-    raw_pcm = buf[data_start:data_end]
-
-    # 16-bit PCM: 2 bytes per sample
-    bytes_per_sample = 2
-    window_samples = int(window_s * sample_rate)
-    if window_samples < 1:
-        window_samples = 3200  # fallback for 16kHz
-
-    window_bytes = window_samples * bytes_per_sample
-    max_bytes = len(raw_pcm) - (len(raw_pcm) % window_bytes)
-
-    rms_values = []
-    for offset in range(0, max_bytes, window_bytes):
-        chunk = raw_pcm[offset:offset + window_bytes]
-        n_samples = len(chunk) // bytes_per_sample
-        if n_samples < 1:
-            continue
-        samples = struct.unpack(f"<{n_samples}h", chunk)
-        sq_sum = sum(s * s for s in samples)
-        rms = math.sqrt(sq_sum / n_samples)
-        dbfs = 20.0 * math.log10(rms / 32767.0) if rms > 0 else -100.0
-        rms_values.append(dbfs)
-
-    return rms_values
-
-
-def _get_audio_rms(video_path, audio_path, language=None, model=None):
-    """Get per-200ms RMS values, using cache when available."""
-    if language is None:
-        language = config.WHISPER_LANGUAGE
-    if model is None:
-        model = config.WHISPER_MODEL
-
-    hash_input = f"{video_path}_{language}_{model}"
-    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-    cache_file = os.path.join(str(config.CACHE_DIR), f"_audio_rms_{file_hash}.json")
-
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r") as f:
-                return _json.load(f)
-        except Exception:
-            pass
-
-    rms = _compute_audio_rms(video_path, audio_path)
-
-    try:
-        os.makedirs(config.CACHE_DIR, exist_ok=True)
-        with open(cache_file, "w") as f:
-            _json.dump(rms, f)
-    except Exception:
-        pass
-
-    return rms
 from utils import fmt_duration as _fmt_duration
-from utils.ffmpeg_utils import _detect_gpu_accel
 from utils import get_video_basename
-# _fmt_duration is imported from utils — no local definition needed
 
+
+# ---------------------------------------------------------------------------
+# Scene detection
+# ---------------------------------------------------------------------------
 
 def detect_scenes(video_path, threshold=None):
     """
     Detect scenes in a video using PySceneDetect ContentDetector.
-    Uses frame_skip for speed and prints progress with ETA.
 
-    Returns list of scenes: [{start, end, duration}].
-    Each scene is a dict with float timestamps in seconds.
+    Uses config.SCENE_FRAME_SKIP to reduce processing time.
+
+    Returns:
+        List of scenes:
+
+        [
+            {
+                "start": float,
+                "end": float,
+                "duration": float,
+            },
+            ...
+        ]
     """
+
     if threshold is None:
         threshold = config.SCENE_THRESHOLD
 
-    frame_skip = getattr(config, 'SCENE_FRAME_SKIP', 2)
+    frame_skip = getattr(
+        config,
+        "SCENE_FRAME_SKIP",
+        2,
+    )
 
     print("=" * 50)
     print("SCENE DETECTION")
     print("=" * 50)
-    print(f"Detector: ContentDetector (threshold={threshold})")
-    print(f"Frame skip: {frame_skip} (processes every {frame_skip+1}th frame)")
+
+    print(
+        f"Detector: ContentDetector "
+        f"(threshold={threshold})"
+    )
+
+    print(
+        f"Frame skip: {frame_skip} "
+        f"(processes every {frame_skip + 1}th frame)"
+    )
+
     print()
 
-    # Open video and get info
-    video = open_video(str(video_path))
+    # ------------------------------------------------------------------
+    # Open video and collect basic information.
+    # ------------------------------------------------------------------
+    video = open_video(
+        str(video_path)
+    )
+
     duration_sec = video.duration.get_seconds()
     fps = video.frame_rate
-    total_frames_est = int(duration_sec * fps)
-    frames_to_process = total_frames_est // (frame_skip + 1)
 
-    # Rough estimate: ~2000 frames/sec on CPU
-    est_sec = max(1, frames_to_process / 2000)
-    print(f"Video: {total_frames_est} frames @ {fps:.2f} fps")
-    print(f"Duration: {duration_sec:.0f}s ({duration_sec/60:.1f}min)")
-    print(f"Will process: ~{frames_to_process} frames (est. {est_sec:.0f}s / {est_sec/60:.1f}min)")
+    total_frames_est = int(
+        duration_sec * fps
+    )
+
+    frames_to_process = max(
+        1,
+        total_frames_est // (frame_skip + 1),
+    )
+
+    # Rough estimate for progress display.
+    est_sec = max(
+        1,
+        frames_to_process / 2000,
+    )
+
+    print(
+        f"Video: {total_frames_est} frames "
+        f"@ {fps:.2f} fps"
+    )
+
+    print(
+        f"Duration: {duration_sec:.0f}s "
+        f"({duration_sec / 60:.1f}min)"
+    )
+
+    print(
+        f"Will process: ~{frames_to_process} frames "
+        f"(est. {est_sec:.0f}s / "
+        f"{est_sec / 60:.1f}min)"
+    )
+
     print()
 
-    # Use low-level SceneManager API
+    # ------------------------------------------------------------------
+    # Configure PySceneDetect.
+    # ------------------------------------------------------------------
     scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector(threshold=threshold))
 
-    start_time = time_module.time()
-    CHECK_INTERVAL = max(500, frames_to_process // 40)  # ~40 updates
+    scene_manager.add_detector(
+        ContentDetector(
+            threshold=threshold
+        )
+    )
+
+    scan_start = time_module.time()
+
+    check_interval = max(
+        500,
+        frames_to_process // 40,
+    )
 
     done_flag = False
 
-    def progress_callback(frame: "np.ndarray", frame_number) -> None:
-        nonlocal start_time, CHECK_INTERVAL, frames_to_process, done_flag
-        # scenedetect 0.7.x passes a FrameTimecode here (0.6.x passes int);
-        # FrameTimecode % int raises TypeError — coerce to plain int first.
-        try:
-            frame_num = int(frame_number)
-        except (TypeError, ValueError):
-            return
-        if frame_num % CHECK_INTERVAL == 0 and frame_num > 0:
-            elapsed = time_module.time() - start_time
-            frames_done = min(frame_num, frames_to_process)
-            pct = min(100.0, frames_done / frames_to_process * 100)
-            # Skip if already at 100% (avoids repeated prints when estimate is exceeded)
-            if pct >= 100.0 and done_flag:
-                return
-            rate = frames_done / max(elapsed, 0.1)
-            remaining_frames = max(0, frames_to_process - frames_done)
-            remaining = remaining_frames / max(rate, 0.1)
-            print(f"  Scan: {pct:.0f}%  ({frames_done}/{frames_to_process})  "
-                  f"elapsed: {_fmt_duration(elapsed)}  "
-                  f"ETA: {_fmt_duration(remaining)}")
-            if pct >= 100.0:
-                done_flag = True
+    def progress_callback(
+        frame,
+        frame_number,
+    ):
+        """
+        Display periodic scene-detection progress.
 
+        PySceneDetect versions may provide either an integer or a
+        FrameTimecode object as frame_number, so we explicitly convert it.
+        """
+
+        nonlocal done_flag
+
+        try:
+            frame_num = int(
+                frame_number
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return
+
+        if frame_num <= 0:
+            return
+
+        if frame_num % check_interval != 0:
+            return
+
+        elapsed = (
+            time_module.time()
+            - scan_start
+        )
+
+        frames_done = min(
+            frame_num,
+            frames_to_process,
+        )
+
+        pct = min(
+            100.0,
+            (
+                frames_done
+                / frames_to_process
+                * 100
+            ),
+        )
+
+        # Avoid repeated 100% messages.
+        if pct >= 100.0 and done_flag:
+            return
+
+        rate = (
+            frames_done
+            / max(elapsed, 0.1)
+        )
+
+        remaining_frames = max(
+            0,
+            frames_to_process
+            - frames_done,
+        )
+
+        remaining = (
+            remaining_frames
+            / max(rate, 0.1)
+        )
+
+        print(
+            f"  Scan: {pct:.0f}% "
+            f"({frames_done}/{frames_to_process}) "
+            f"elapsed: {_fmt_duration(elapsed)} "
+            f"ETA: {_fmt_duration(remaining)}"
+        )
+
+        if pct >= 100.0:
+            done_flag = True
+
+    # ------------------------------------------------------------------
+    # Run scene detection.
+    # ------------------------------------------------------------------
     print("Starting frame scan...")
+
     scene_manager.detect_scenes(
         video=video,
         frame_skip=frame_skip,
         callback=progress_callback,
     )
 
-    elapsed = time_module.time() - start_time
-    print(f"  Scan complete in {_fmt_duration(elapsed)}")
+    elapsed = (
+        time_module.time()
+        - scan_start
+    )
 
-    scene_list = scene_manager.get_scene_list()
+    print(
+        f"  Scan complete in "
+        f"{_fmt_duration(elapsed)}"
+    )
+
+    # ------------------------------------------------------------------
+    # Convert PySceneDetect results to our normalized structure.
+    # ------------------------------------------------------------------
+    scene_list = (
+        scene_manager.get_scene_list()
+    )
+
     scenes = []
-    for start_time_ft, end_time_ft in scene_list:
-        start_sec = start_time_ft.get_seconds()
-        end_sec = end_time_ft.get_seconds()
-        scenes.append({
-            "start": start_sec,
-            "end": end_sec,
-            "duration": end_sec - start_sec,
-        })
 
-    print(f"  Found {len(scenes)} scenes")
+    for (
+        start_timecode,
+        end_timecode,
+    ) in scene_list:
+
+        start_sec = (
+            start_timecode.get_seconds()
+        )
+
+        end_sec = (
+            end_timecode.get_seconds()
+        )
+
+        scenes.append(
+            {
+                "start": start_sec,
+                "end": end_sec,
+                "duration": (
+                    end_sec
+                    - start_sec
+                ),
+            }
+        )
+
+    print(
+        f"  Found {len(scenes)} scenes"
+    )
+
     return scenes
 
 
-def merge_short_scenes(scenes, min_duration=None, max_duration=None):
+# ---------------------------------------------------------------------------
+# Scene merging
+# ---------------------------------------------------------------------------
+
+def merge_short_scenes(
+    scenes,
+    min_duration=None,
+    max_duration=None,
+):
     """
-    Merge short scenes with neighbours.
+    Merge short scenes with neighbouring scenes.
 
     Rules:
+
     1. Start a buffer with the first raw scene.
-    2. If buffer < min_duration: merge next scene INTO buffer (build it up).
-    3. If buffer >= min_duration:
-       - If next scene is long (>= min_duration): buffer is final, start new buffer.
-       - If next scene is short (< min_duration): DON'T extend old buffer.
-         Start a NEW short buffer (will merge with subsequent short scenes).
-       - If buffer >= max_duration: force-finalize, start new buffer.
-    4. No snowball effect — short scenes never extend an already-adequate buffer.
+    2. If the buffer is shorter than min_duration, merge the next scene
+       into it.
+    3. Once the buffer reaches min_duration:
+       - If the next scene is also long enough, finalize the buffer.
+       - If the next scene is short, start a new short buffer.
+    4. If the buffer reaches max_duration, force-finalize it.
+
+    This avoids the old snowball effect where short scenes could cause
+    already-good scenes to become unnecessarily long.
     """
+
     if min_duration is None:
         min_duration = config.MIN_SCENE_DURATION
+
     if max_duration is None:
         max_duration = config.MAX_MERGE_DURATION
 
@@ -258,26 +312,44 @@ def merge_short_scenes(scenes, min_duration=None, max_duration=None):
         return []
 
     merged = []
+
     buffer = scenes[0].copy()
 
-    for i in range(1, len(scenes)):
-        current = scenes[i].copy()
+    for scene in scenes[1:]:
+        current = scene.copy()
 
-        # Force-finalize if buffer already at max
+        # ---------------------------------------------------------------
+        # Buffer already reached maximum size.
+        # ---------------------------------------------------------------
         if buffer["duration"] >= max_duration:
             merged.append(buffer)
             buffer = current
             continue
 
-        # Buffer too short — merge current into it
+        # ---------------------------------------------------------------
+        # Buffer is too short.
+        # Merge the current scene into it.
+        # ---------------------------------------------------------------
         if buffer["duration"] < min_duration:
             buffer["end"] = current["end"]
-            buffer["duration"] = buffer["end"] - buffer["start"]
-        # Current is short — start a new buffer (don't extend old one)
+
+            buffer["duration"] = (
+                buffer["end"]
+                - buffer["start"]
+            )
+
+        # ---------------------------------------------------------------
+        # Current scene is short.
+        # Do not extend an already-good buffer.
+        # ---------------------------------------------------------------
         elif current["duration"] < min_duration:
             merged.append(buffer)
             buffer = current
-        # Both long enough — start new buffer
+
+        # ---------------------------------------------------------------
+        # Both scenes are long enough.
+        # Start a new buffer.
+        # ---------------------------------------------------------------
         else:
             merged.append(buffer)
             buffer = current
@@ -285,314 +357,167 @@ def merge_short_scenes(scenes, min_duration=None, max_duration=None):
     if buffer is not None:
         merged.append(buffer)
 
-    print(f"  After merging short scenes: {len(merged)} scenes")
+    print(
+        f"  After merging short scenes: "
+        f"{len(merged)} scenes"
+    )
+
     return merged
 
 
-def get_scene_transcripts(video_path, scenes, language=None):
-    """
-    Transcribe the FULL movie audio once, then map segments to scenes.
-    Much faster than transcribing each scene separately.
+# ---------------------------------------------------------------------------
+# Scene + external subtitle analysis
+# ---------------------------------------------------------------------------
 
-    Args:
-        video_path: path to video file
-        scenes: list of {start, end, duration} dicts
-        language: transcription language code (None = config default)
-
-    Returns: [{start, end, duration, text}]
-    """
-    if not scenes:
-        return []
-    if language is None:
-        language = config.WHISPER_LANGUAGE
-
-    # Extract full audio once
-    print("Extracting full audio for transcription...")
-    print("  ffmpeg: extracting PCM audio (16kHz mono WAV)...")
-
-    # Get video duration for progress tracking
-    audio_duration = 0
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "format=duration", "-of",
-             "default=noprint_wrappers=1:nokey=1", str(video_path)],
-            capture_output=True, text=True, check=True, timeout=30
-        )
-        audio_duration = float(result.stdout.strip())
-        est_extract = max(20, audio_duration / 250)
-        print(f"  Audio duration: {audio_duration/60:.1f} min")
-        gpu = _detect_gpu_accel()
-        gpu_tag = "CUDA" if gpu else "CPU"
-        print(f"  Est. extraction: ~{_fmt_duration(est_extract)} (ffmpeg, {gpu_tag})")
-    except FileNotFoundError:
-        print()
-        print("  ⚠️  ffprobe/ffmpeg не найдены!")
-        print("  Установи FFmpeg: https://ffmpeg.org/download.html")
-        print("  Или через winget: winget install FFmpeg")
-        print("  После установки перезапусти программу.")
-        print()
-        return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": "",
-                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
-                                 "silence_ratio": 1.0}}
-                for s in scenes]
-    except Exception:
-        print("  Audio duration: unknown")
-        print()
-
-    temp_audio = os.path.join(str(config.TEMP_DIR), f"_full_audio_{os.getpid()}.wav")
-    os.makedirs(config.TEMP_DIR, exist_ok=True)
-
-    # Run ffmpeg with progress parsing (stderr has frame/time info)
-    print("  Starting ffmpeg extraction...")
-    try:
-        proc = subprocess.Popen(
-            ["ffmpeg", "-y", "-i", str(video_path), "-vn",
-             "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-loglevel", "info",
-             temp_audio],
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1,
-        )
-
-        extract_start_time = time_module.time()
-        last_report = 0.0
-        time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
-        for stderr_line in proc.stderr:
-            m = time_pattern.search(stderr_line)
-            if m:
-                hh, mm, ss = int(m.group(1)), int(m.group(2)), float(m.group(3))
-                current_sec = hh * 3600 + mm * 60 + ss
-
-                now = time_module.time()
-                if now - last_report > 2.0:
-                    last_report = now
-                    wall_elapsed = now - extract_start_time
-                    if audio_duration > 0:
-                        pct = current_sec / audio_duration * 100
-                        if current_sec > 0:
-                            speed = current_sec / max(wall_elapsed, 0.1)
-                            remaining_audio = audio_duration - current_sec
-                            eta = remaining_audio / speed
-                        else:
-                            eta = 0
-                        print(f"  Audio extraction: {pct:.0f}%  "
-                              f"elapsed {_fmt_duration(wall_elapsed)}  "
-                              f"ETA {_fmt_duration(eta)}")
-                    else:
-                        print(f"  Audio extraction: {_fmt_duration(current_sec)}...")
-
-        proc.wait(timeout=900)
-        if proc.returncode != 0:
-            raise subprocess.CalledProcessError(proc.returncode, proc.args)
-
-        print("  Audio extracted successfully.")
-    except FileNotFoundError:
-        print()
-        print("  ⚠️  ffmpeg не найден!")
-        print("  Установи FFmpeg: https://ffmpeg.org/download.html")
-        print("  Или через winget (админ): winget install FFmpeg")
-        print("  После установки перезапусти программу.")
-        print()
-        _cleanup_temp_audio(temp_audio)
-        return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": "",
-                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
-                                 "silence_ratio": 1.0}}
-                for s in scenes]
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        print("  Error: Audio extraction timed out (>15min)")
-        _cleanup_temp_audio(temp_audio)
-        return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": "",
-                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
-                                 "silence_ratio": 1.0}}
-                for s in scenes]
-    except subprocess.CalledProcessError:
-        print("  Warning: Could not extract audio")
-        _cleanup_temp_audio(temp_audio)
-        return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": "",
-                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
-                                 "silence_ratio": 1.0}}
-                for s in scenes]
-    except BaseException:
-        _cleanup_temp_audio(temp_audio)
-        raise
-
-    # Compute audio RMS envelope (per-200ms window) — cached per film
-    print("Computing audio RMS envelope...")
-    try:
-        audio_rms = _get_audio_rms(video_path, temp_audio, language)
-    except Exception:
-        audio_rms = []
-    if audio_rms:
-        print(f"  Got {len(audio_rms)} RMS values ({len(audio_rms)/5:.1f}s of audio)")
-    else:
-        print("  RMS computation skipped or unavailable")
-
-    # Transcribe full audio once (cached model)
-    # (temp_audio is cleaned up inside _transcribe_audio_file)
-    print()
-    print("Starting Whisper transcription...")
-    all_segments = _transcribe_audio_file(temp_audio, language)
-
-    print(f"  Got {len(all_segments)} transcript segments total")
-
-    # Save full transcript to JSON for reuse across clips
-    from core.subtitle import save_segments_json
-    video_basename = get_video_basename(video_path)
-    hash_input = f"{video_path}_{language}_{config.WHISPER_MODEL}"
-    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-    transcript_json = os.path.join(
-        str(config.CACHE_DIR),
-        f"full_transcript_{video_basename}_{file_hash}.json"
-    )
-    os.makedirs(config.CACHE_DIR, exist_ok=True)
-    save_segments_json(all_segments, transcript_json)
-
-    PAUSE_GAP = config.DIALOGUE_PAUSE_THRESHOLD
-
-    # Map transcript segments to scenes by time overlap
-    results = []
-    for i, scene in enumerate(scenes):
-        start_s = scene["start"]
-        end_s = scene["end"]
-
-        # Collect overlapping transcript segments (sorted by time)
-        overlapping = []
-        for seg in all_segments:
-            if seg["start"] < end_s and seg["end"] > start_s:
-                overlapping.append(seg)
-        overlapping.sort(key=lambda s: s["start"])
-
-        # Build ONE result per scene with advisory pause_points
-        scene_text = " ".join(s["text"] for s in overlapping).strip()
-        pause_points = []
-        for j in range(len(overlapping) - 1):
-            gap = overlapping[j + 1]["start"] - overlapping[j]["end"]
-            if gap > PAUSE_GAP:
-                pause_points.append({
-                    "gap_start": overlapping[j]["end"],
-                    "gap_end": overlapping[j + 1]["start"],
-                })
-
-        block = {
-            "start": start_s,
-            "end": end_s,
-            "duration": end_s - start_s,
-            "text": scene_text,
-            "pause_points": pause_points,
-        }
-
-        # Compute audio_peaks from RMS envelope (5 values/sec = 200ms windows)
-        if audio_rms:
-            start_idx = int(start_s * 5)
-            end_idx = int(end_s * 5)
-            block_rms = audio_rms[max(0, start_idx):end_idx]
-            if block_rms:
-                peak_rms = max(block_rms)
-                loud_peak_count = sum(1 for v in block_rms if v > -20)
-                silence_ratio = sum(1 for v in block_rms if v < -50) / len(block_rms)
-            else:
-                peak_rms = 0.0
-                loud_peak_count = 0
-                silence_ratio = 1.0
-        else:
-            peak_rms = 0.0
-            loud_peak_count = 0
-            silence_ratio = 1.0
-        block["audio_peaks"] = {
-            "peak_rms": peak_rms,
-            "loud_peak_count": loud_peak_count,
-            "silence_ratio": silence_ratio,
-        }
-        if "cut_count" in scene:
-            block["cut_count"] = scene["cut_count"]
-        results.append(block)
-
-        if (i + 1) % 20 == 0:
-            print(f"  Mapped {i+1}/{len(scenes)} scenes to transcripts")
-
-    # Cleanup temp audio (already handled by _transcribe_audio_file)
-    return results
-
-
-def detect_and_transcribe(video_path, language=None, subtitle_path=None):
+def detect_and_transcribe(
+    video_path,
+    language=None,
+    subtitle_path=None,
+):
     """
     Detect scenes and map an external subtitle file onto those scenes.
 
     IMPORTANT:
-        Whisper is intentionally NOT used here.
+        Whisper is intentionally NOT used.
 
-    Subtitles are mandatory for the automatic pipeline. If no subtitle
-    file can be found, this function raises a clear Missing subtitles error.
+    External subtitles are mandatory for the automatic movie pipeline.
 
     Supported subtitle formats:
+
         .srt
         .ass
         .ssa
         .vtt
+
+    Args:
+        video_path:
+            Source movie/video.
+
+        language:
+            Kept for API compatibility with the existing pipeline.
+            It is not used for transcription because transcription is
+            performed from the supplied external subtitle file.
+
+        subtitle_path:
+            Optional explicit subtitle path.
+
+    Returns:
+        List of scene blocks:
+
+        [
+            {
+                "start": float,
+                "end": float,
+                "duration": float,
+                "text": str,
+                "pause_points": list,
+                "cut_count": int,
+                "audio_peaks": dict,
+            },
+            ...
+        ]
+
+    Raises:
+        RuntimeError:
+            If no external subtitle file can be found or parsed.
     """
 
     # ------------------------------------------------------------------
-    # 1. Find subtitles BEFORE doing expensive scene/transcription work.
+    # 1. Resolve external subtitles FIRST.
+    #
+    # This happens before expensive scene detection so that a movie
+    # without subtitles fails immediately instead of spending several
+    # minutes analyzing the video.
     # ------------------------------------------------------------------
-    subtitle_path = find_external_subtitle(
+    resolved_subtitle_path = find_external_subtitle(
         video_path,
         explicit_path=subtitle_path,
     )
 
-    if not subtitle_path:
+    if not resolved_subtitle_path:
         raise RuntimeError(
-            "Missing subtitles: no .srt, .ass, .ssa or .vtt subtitle "
-            "file was found for this movie."
+            "Missing subtitles: no .srt, .ass, .ssa "
+            "or .vtt subtitle file was found for "
+            "this movie."
         )
+
+    subtitle_path = resolved_subtitle_path
 
     print()
     print("=" * 50)
     print("SUBTITLE INPUT")
     print("=" * 50)
-    print(f"  Using subtitles: {os.path.basename(subtitle_path)}")
+
+    print(
+        f"  Using subtitles: "
+        f"{os.path.basename(subtitle_path)}"
+    )
 
     # ------------------------------------------------------------------
-    # 2. Parse subtitles.
+    # 2. Parse external subtitles.
     # ------------------------------------------------------------------
     try:
-        subtitle_segments = load_external_subtitles(subtitle_path)
-    except Exception as e:
+        subtitle_segments = (
+            load_external_subtitles(
+                subtitle_path
+            )
+        )
+
+    except Exception as error:
         raise RuntimeError(
-            f"Missing subtitles / subtitle parsing failed: {e}"
-        ) from e
+            "Missing subtitles / subtitle parsing "
+            f"failed: {error}"
+        ) from error
 
     if not subtitle_segments:
         raise RuntimeError(
-            f"Missing subtitles: {os.path.basename(subtitle_path)} "
+            "Missing subtitles: "
+            f"{os.path.basename(subtitle_path)} "
             "contains no usable subtitle cues."
         )
 
     print(
-        f"  ✓ Loaded {len(subtitle_segments)} subtitle cues"
+        f"  ✓ Loaded "
+        f"{len(subtitle_segments)} subtitle cues"
     )
 
     # ------------------------------------------------------------------
     # 3. Detect visual scenes.
     # ------------------------------------------------------------------
-    scenes = detect_scenes(video_path)
-    merged = merge_short_scenes(scenes)
+    scenes = detect_scenes(
+        video_path
+    )
 
-    for m in merged:
-        m["cut_count"] = sum(
+    merged = merge_short_scenes(
+        scenes
+    )
+
+    # ------------------------------------------------------------------
+    # Count raw visual cuts contained in each merged block.
+    # ------------------------------------------------------------------
+    for block in merged:
+        block["cut_count"] = sum(
             1
-            for r in scenes
-            if r["start"] >= m["start"]
-            and r["end"] <= m["end"]
+            for raw_scene in scenes
+            if (
+                raw_scene["start"]
+                >= block["start"]
+            )
+            and (
+                raw_scene["end"]
+                <= block["end"]
+            )
         )
 
+    # ------------------------------------------------------------------
+    # If PySceneDetect somehow finds nothing, use the whole movie as
+    # one block.
+    # ------------------------------------------------------------------
     if not merged:
-        print("  No scenes detected, treating whole video as one scene")
+        print(
+            "  No scenes detected, "
+            "treating whole video as one scene"
+        )
 
         try:
             result = subprocess.run(
@@ -603,7 +528,9 @@ def detect_and_transcribe(video_path, language=None, subtitle_path=None):
                     "-show_entries",
                     "format=duration",
                     "-of",
-                    "default=noprint_wrappers=1:nokey=1",
+                    "default="
+                    "noprint_wrappers=1:"
+                    "nokey=1",
                     str(video_path),
                 ],
                 capture_output=True,
@@ -612,56 +539,101 @@ def detect_and_transcribe(video_path, language=None, subtitle_path=None):
                 timeout=30,
             )
 
-            duration = float(result.stdout.strip())
+            duration = float(
+                result.stdout.strip()
+            )
 
         except Exception:
+            # If ffprobe is unavailable, the last subtitle cue gives us
+            # a reasonable fallback duration.
             duration = (
                 subtitle_segments[-1]["end"]
                 if subtitle_segments
                 else 0
             )
 
-        merged = [{
-            "start": 0,
-            "end": duration,
-            "duration": duration,
-            "cut_count": 0,
-        }]
+        merged = [
+            {
+                "start": 0,
+                "end": duration,
+                "duration": duration,
+                "cut_count": 0,
+            }
+        ]
 
     # ------------------------------------------------------------------
-    # 4. Map subtitles to scenes.
+    # 4. Map external subtitle cues to each visual scene.
     #
-    # No audio extraction.
-    # No Whisper.
-    # No speech recognition.
+    # There is deliberately NO:
+    #
+    #   - audio extraction
+    #   - Whisper
+    #   - speech recognition
+    #   - audio RMS calculation
+    #
+    # The subtitle file is the source of dialogue/action information.
     # ------------------------------------------------------------------
     results = []
 
-    for i, scene in enumerate(merged):
+    for index, scene in enumerate(
+        merged
+    ):
         scene_start = scene["start"]
         scene_end = scene["end"]
 
+        # Find subtitle cues that overlap this scene.
         overlapping = [
-            seg
-            for seg in subtitle_segments
-            if seg["start"] < scene_end
-            and seg["end"] > scene_start
+            segment
+            for segment in subtitle_segments
+            if (
+                segment["start"]
+                < scene_end
+            )
+            and (
+                segment["end"]
+                > scene_start
+            )
         ]
 
+        overlapping.sort(
+            key=lambda segment: (
+                segment["start"],
+                segment["end"],
+            )
+        )
+
+        # Combine subtitle text for LLM analysis.
         text_parts = [
-            seg["text"].strip()
-            for seg in overlapping
-            if seg.get("text", "").strip()
+            segment["text"].strip()
+            for segment in overlapping
+            if segment.get(
+                "text",
+                "",
+            ).strip()
         ]
 
         block = {
             "start": scene_start,
             "end": scene_end,
-            "duration": scene_end - scene_start,
-            "text": " ".join(text_parts),
+            "duration": (
+                scene_end
+                - scene_start
+            ),
+            "text": " ".join(
+                text_parts
+            ),
             "pause_points": [],
-            "cut_count": scene.get("cut_count", 0),
-            # Do NOT mark subtitle-only blocks as silence.
+            "cut_count": scene.get(
+                "cut_count",
+                0,
+            ),
+
+            # Subtitle-only mode does not calculate audio RMS.
+            #
+            # IMPORTANT:
+            # silence_ratio is 0 rather than 1 because the absence of
+            # audio analysis must NOT cause the LLM/filtering stage to
+            # classify every subtitle block as silent.
             "audio_peaks": {
                 "peak_rms": 0.0,
                 "loud_peak_count": 0,
@@ -669,37 +641,61 @@ def detect_and_transcribe(video_path, language=None, subtitle_path=None):
             },
         }
 
-        # Detect pauses between subtitle cues.
-        for j in range(len(overlapping) - 1):
+        # --------------------------------------------------------------
+        # Find meaningful gaps between subtitle cues.
+        #
+        # These gaps become candidate natural dialogue boundaries for
+        # later clip selection.
+        # --------------------------------------------------------------
+        for cue_index in range(
+            len(overlapping) - 1
+        ):
+            current = overlapping[
+                cue_index
+            ]
+
+            following = overlapping[
+                cue_index + 1
+            ]
+
             gap = (
-                overlapping[j + 1]["start"]
-                - overlapping[j]["end"]
+                following["start"]
+                - current["end"]
             )
 
+            # A gap over 0.8 sec is a useful candidate boundary.
             if gap > 0.8:
-                block["pause_points"].append(
-                    round(overlapping[j]["end"], 3)
+                block[
+                    "pause_points"
+                ].append(
+                    round(
+                        current["end"],
+                        3,
+                    )
                 )
 
         results.append(block)
 
-        if (i + 1) % 20 == 0:
+        if (
+            index + 1
+        ) % 20 == 0:
             print(
-                f"  Mapped subtitles to "
-                f"{i + 1}/{len(merged)} scenes"
+                "  Mapped subtitles to "
+                f"{index + 1}/"
+                f"{len(merged)} scenes"
             )
 
     # ------------------------------------------------------------------
-    # 5. Save the normalized subtitle transcript to the existing cache.
+    # 5. Save the parsed subtitle transcript to the existing cache.
     #
-    # This is important because the rendering pipeline already knows how
-    # to consume transcript JSON. We reuse that mechanism instead of
-    # introducing another rendering path.
+    # The cache filename includes the subtitle modification time, so
+    # replacing/editing the subtitle file automatically creates a new
+    # cache instead of accidentally reusing stale subtitle data.
     # ------------------------------------------------------------------
     try:
-        import hashlib
-
-        video_basename = get_video_basename(video_path)
+        video_basename = get_video_basename(
+            video_path
+        )
 
         hash_input = (
             f"{video_path}_"
@@ -713,7 +709,16 @@ def detect_and_transcribe(video_path, language=None, subtitle_path=None):
 
         cache_path = (
             Path(config.CACHE_DIR)
-            / f"full_transcript_{video_basename}_{file_hash}.json"
+            / (
+                f"full_transcript_"
+                f"{video_basename}_"
+                f"{file_hash}.json"
+            )
+        )
+
+        os.makedirs(
+            config.CACHE_DIR,
+            exist_ok=True,
         )
 
         save_segments_json(
@@ -722,17 +727,20 @@ def detect_and_transcribe(video_path, language=None, subtitle_path=None):
         )
 
         print(
-            f"  Subtitle transcript cache: "
+            "  Subtitle transcript cache: "
             f"{cache_path.name}"
         )
 
-    except Exception as e:
+    except Exception as error:
+        # Cache failure should not destroy an otherwise valid analysis.
         print(
-            f"  ⚠ Could not save subtitle cache: {e}"
+            "  ⚠ Could not save subtitle cache: "
+            f"{error}"
         )
 
     print(
-        f"  ✓ {len(results)} scenes mapped to subtitles"
+        f"  ✓ {len(results)} scenes "
+        "mapped to subtitles"
     )
 
     return results
