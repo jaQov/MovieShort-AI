@@ -1073,7 +1073,7 @@ UI = {
         "max_len": "Max clip length (s)",
         "processing_opts": "Processing options",
         "subs_label": "Subtitles",
-        "subs_info": "Uses the uploaded subtitle file to overlay subtitles on the video",
+        "subs_info": "Required — every clip needs the uploaded subtitle file, this can't be turned off",
         "face_label": "Smart centering (Face tracking)",
         "face_info": "Analyzes face positions and centers the frame on them",
         "banner_label": "Banner padding",
@@ -1490,7 +1490,7 @@ def create_app() -> gr.Blocks:
                 )
                 with gr.Group():
                     gr.Markdown(f"### {_t('processing_opts', ui_lang)}")
-                    m_subs = gr.Checkbox(value=cfg.get("subtitles", True),
+                    m_subs = gr.Checkbox(value=True, interactive=False,
                         label=_t("subs_label", ui_lang),
                         info=_t("subs_info", ui_lang))
                     m_face = gr.Checkbox(value=cfg.get("face_tracking", True),
@@ -1784,7 +1784,7 @@ def create_app() -> gr.Blocks:
                     )
                 with gr.Group():
                     gr.Markdown(f"### {_t('processing_opts', ui_lang)}")
-                    a_subs = gr.Checkbox(value=cfg.get("subtitles", True),
+                    a_subs = gr.Checkbox(value=True, interactive=False,
                         label=_t("subs_label", ui_lang),
                         info=_t("subs_info", ui_lang))
                     a_face = gr.Checkbox(value=cfg.get("face_tracking", True),
