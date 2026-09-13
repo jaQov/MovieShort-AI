@@ -50,8 +50,8 @@ def process_movie(video_path, settings=None):
     Args:
         video_path: path to movie file
         settings: dict with keys:
-            - max_duration (int): max clip length in seconds (default 60)
-            - min_duration (int): min clip length in seconds (default 15)
+            - max_duration / min_duration: not accepted from the GUI —
+              every clip is a fixed 60-180s, see config.DEFAULT_MIN/MAX_CLIP_DURATION.
             - subtitles (bool): enable subtitles (default True)
             - face_tracking (bool): enable face tracking (default True)
             - subtitle_path (str): external subtitle file (required)
@@ -344,9 +344,9 @@ def _validate_sub_clips(sub_clips, block_start, block_end, block_duration,
                         min_duration=20, max_duration=75):
     """Validate sub-clips from LLM response.
 
-    Applies per-sub-clip:
+    Applies per-sub-clip, no exceptions:
     1. Within block bounds
-    2. Duration >= min_duration (unless self-contained)
+    2. Duration >= min_duration
     3. Duration <= max_duration
     4. Score 1-10
     5. No negative start or overflow
@@ -360,12 +360,11 @@ def _validate_sub_clips(sub_clips, block_start, block_end, block_duration,
         sc_dur = sc_end - sc_start
         sc_score = sc.get("score", 5)
         sc_title = sc.get("title", "") or "untitled"
-        sc_reason = sc.get("reason", "")
 
         if sc_start < 0 or sc_end > block_end:
             print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — outside block bounds")
             continue
-        if sc_dur < min_duration and sc_reason != "self_contained":
+        if sc_dur < min_duration:
             print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — too short ({sc_dur:.0f}s)")
             continue
         if sc_dur > max_duration:
@@ -546,7 +545,7 @@ def _split_batches(blocks, batch_size, content_budget):
 
 
 def find_best_clips_context(video_path, movie_title,
-                            max_duration=60, min_duration=15,
+                            max_duration=180, min_duration=60,
                             num_clips=10, score_threshold=7.0,
                             subtitle_path=None):
     """Context mode: detect blocks → local LLM splits each block into sub-clips.
@@ -780,11 +779,10 @@ def find_best_clips_context(video_path, movie_title,
                         sc_dur = sc_end - sc_start
                         sc_score = sc.get("score", 5)
                         sc_title = sc.get("title", "") or "untitled"
-                        sc_reason = sc.get("reason", "")
                         reasons = []
                         if sc_start < block_start or sc_end > block_end:
                             reasons.append("out_of_bounds")
-                        if sc_dur < min_duration and sc_reason != "self_contained":
+                        if sc_dur < min_duration:
                             reasons.append(f"too_short({sc_dur:.0f}s)")
                         if sc_dur > max_duration:
                             reasons.append(f"too_long({sc_dur:.0f}s)")
@@ -1015,6 +1013,14 @@ def _find_best_window(segments, scene_start, scene_end, window_dur):
     # Clamp to scene boundaries
     new_start = max(scene_start, new_start)
     new_end = min(scene_end, new_end)
+
+    # The natural-boundary extension above can push new_end past a subtitle
+    # segment that runs well beyond the window — clamped only to scene_end,
+    # a single long segment could blow well past window_dur (max_duration).
+    # Trim back to the cap so a fallback clip can never violate the same
+    # duration rule LLM-selected clips are held to.
+    if new_end - new_start > window_dur:
+        new_end = new_start + window_dur
 
     # Ensure at least some minimum duration
     if new_end - new_start < 5:

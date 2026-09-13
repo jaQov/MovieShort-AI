@@ -1070,7 +1070,7 @@ UI = {
         "movie_title": "Movie title (optional)",
         "tc_range": "Timecode",
         "tc_hint": "Timecodes are added progressively: complete an interval and the next field appears",
-        "max_len": "Max clip length (s)",
+        "clip_length_rule": "Every generated clip is 1-3 minutes long (fixed).",
         "processing_opts": "Processing options",
         "subs_label": "Subtitles",
         "subs_info": "Required — every clip needs the uploaded subtitle file, this can't be turned off",
@@ -1084,7 +1084,6 @@ UI = {
         "blur_info": "Fills empty space with a blurred copy of the video (9:16 format)",
         "anti_label": "Anti-copyright",
         "anti_info": "Subtle transformations (mirror, contrast, brightness) to bypass Content ID",
-        "min_len": "Min length (s)",
         "num_clips": "Number of clips",
         "score_threshold": "Score threshold",
         "score_threshold_info": "Minimum scene score (1-10) to include in results",
@@ -1759,17 +1758,7 @@ def create_app() -> gr.Blocks:
                     inputs=[queue_state, auto_file, auto_subtitle_file, movie_title_box],
                     outputs=[queue_state, queue_display, auto_file, auto_subtitle_file, movie_title_box],
                 ).then(fn=lambda: gr.update(value="", visible=False), inputs=[], outputs=[auto_upload_progress])
-                with gr.Row():
-                    min_dur = gr.Slider(
-                        minimum=15, maximum=60,
-                        value=cfg.get("min_duration", 15),
-                        label=_t("min_len", ui_lang)
-                    )
-                    max_dur2 = gr.Slider(
-                        minimum=30, maximum=180,
-                        value=cfg.get("max_duration", 60),
-                        label=_t("max_len", ui_lang)
-                    )
+                gr.Markdown(f"<span style='font-size:12px;color:#9C988B'>{_t('clip_length_rule', ui_lang)}</span>")
                 with gr.Row():
                     num_clips = gr.Slider(
                         minimum=5, maximum=20, step=1,
@@ -1815,7 +1804,7 @@ def create_app() -> gr.Blocks:
                     value=_t("wait_start", ui_lang) + "\n"
                 )
 
-                def on_auto_process(queue, min_d, max_d,
+                def on_auto_process(queue,
                                     n_clips, s_thresh,
                                     subs, face, banner, bt, bb, blur, anti,
                                     sub_font_name, sub_size, sub_outline, sub_color_name,
@@ -1828,8 +1817,6 @@ def create_app() -> gr.Blocks:
 
                     # Save current settings as defaults
                     cfg_save = user_config.load()
-                    cfg_save["min_duration"] = min_d
-                    cfg_save["max_duration"] = max_d
                     cfg_save["subtitles"] = subs
                     cfg_save["face_tracking"] = face
                     cfg_save["banner_top"] = bt
@@ -1858,8 +1845,9 @@ def create_app() -> gr.Blocks:
                             _font_family2 = sub_font_name or "Arial"
                         _font_style2 = {"font": _font_family2, "size": int(sub_size) if sub_size is not None else 13, "color": _cval2, "outline": int(sub_outline) if sub_outline is not None else 1, "bold": bool(sub_bold), "italic": bool(sub_italic), "shadow": bool(sub_shadow), "position_y": int(sub_position) if sub_position is not None else 400}
                         settings = {
-                            "min_duration": min_d,
-                            "max_duration": max_d,
+                            # min/max duration intentionally omitted — fixed
+                            # 60-180s rule from config.DEFAULT_MIN/MAX_CLIP_DURATION,
+                            # not user-configurable.
                             "subtitles": subs,
                             "face_tracking": face,
                             "anti_copyright": anti,
@@ -2187,7 +2175,7 @@ def create_app() -> gr.Blocks:
                     )
                     auto_btn.click(
                         fn=on_auto_process,
-                        inputs=[queue_state, min_dur, max_dur2,
+                        inputs=[queue_state,
                                 num_clips, score_thresh,
                                 a_subs, a_face, a_banner, a_banner_top, a_banner_bottom,
                                 a_blur, a_anti,

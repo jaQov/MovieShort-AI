@@ -19,9 +19,10 @@ WHISPER_DEVICE = "auto"          # "auto", "cpu", or "cuda"
 FORCE_CPU = False                # True = force CPU even if GPU available
 WHISPER_BEAM_SIZE = 5            # Beam size for transcription accuracy
 
-# Video processing defaults
-DEFAULT_MAX_CLIP_DURATION = 60   # seconds
-DEFAULT_MIN_CLIP_DURATION = 15   # seconds
+# Video processing defaults — fixed rule, not user-configurable: every
+# generated clip must be 1-3 minutes long.
+DEFAULT_MAX_CLIP_DURATION = 180  # seconds
+DEFAULT_MIN_CLIP_DURATION = 60   # seconds
 VERTICAL_WIDTH = 1080
 VERTICAL_HEIGHT = 1920
 
@@ -51,8 +52,8 @@ DIALOGUE_PAUSE_THRESHOLD = 2.0   # seconds — gap > this = scene boundary
 # window Ollama can't fit alongside the model's weights forces a CPU/GPU
 # split, which is dramatically slower, not just "a bit slower".
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "mistral-nemo:12b"
-OLLAMA_NUM_CTX = 8192
+OLLAMA_MODEL = "qwen3:8b"
+OLLAMA_NUM_CTX = 16000
 
 # Anti-copyright measures (slight transformations to avoid Content ID)
 ANTI_COPYRIGHT = True           # master toggle

@@ -170,9 +170,16 @@ def check_ollama() -> dict:
         resp.raise_for_status()
 
         result = resp.json()
-        content = result.get("message", {}).get("content", "")
+        message = result.get("message", {})
+        content = message.get("content", "")
 
-        if content:
+        # Thinking models (Qwen3) can spend the entire num_predict budget on
+        # their reasoning trace before emitting any final "content" — that's
+        # not a broken model, just one still mid-thought. A non-empty
+        # "thinking" field is equally good evidence the model is alive and
+        # responding, without needing to guess a token budget generous
+        # enough to always clear the reasoning trace first.
+        if content or message.get("thinking"):
             return {"ok": True}
 
         return {"ok": False, "error": "Ollama: empty response"}
@@ -203,9 +210,8 @@ PROMPT_BATCH_TO_CLIPS = (
     "{blocks_text}\n"
     "---\n\n"
     "Rules (per block):\n"
-    "- Each clip: {min_duration}-{max_duration} seconds. Prefer around {pref_duration} seconds.\n"
-    "- Clips shorter than {min_duration} seconds are allowed ONLY with reason=\"self_contained\"\n"
-    "  (complete joke, quotable line, self-sufficient moment).\n"
+    "- Each clip MUST be {min_duration}-{max_duration} seconds — no exceptions,\n"
+    "  no shorter clips regardless of content. Prefer around {pref_duration} seconds.\n"
     "- start/end are ABSOLUTE seconds from MOVIE START (not block-relative).\n"
     "- Clips within ONE block must NOT overlap.\n"
     "- Decide how many clips per block. 1-3 is usually enough.\n"
