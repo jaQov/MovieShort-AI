@@ -340,13 +340,14 @@ def _snap_scene_boundary(clip_segments, scene_start, scene_end, max_dur):
 # Context Mode — LLM sees real scene transcripts, picks best scenes directly
 # ---------------------------------------------------------------------------
 
-def _validate_sub_clips(sub_clips, block_start, block_end, block_duration):
+def _validate_sub_clips(sub_clips, block_start, block_end, block_duration,
+                        min_duration=20, max_duration=75):
     """Validate sub-clips from LLM response.
 
     Applies per-sub-clip:
     1. Within block bounds
-    2. Duration >= 20s (unless self-contained)
-    3. Duration <= 75s
+    2. Duration >= min_duration (unless self-contained)
+    3. Duration <= max_duration
     4. Score 1-10
     5. No negative start or overflow
 
@@ -364,10 +365,10 @@ def _validate_sub_clips(sub_clips, block_start, block_end, block_duration):
         if sc_start < 0 or sc_end > block_end:
             print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — outside block bounds")
             continue
-        if sc_dur < 20 and sc_reason != "self_contained":
+        if sc_dur < min_duration and sc_reason != "self_contained":
             print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — too short ({sc_dur:.0f}s)")
             continue
-        if sc_dur > 75:
+        if sc_dur > max_duration:
             print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — too long ({sc_dur:.0f}s)")
             continue
         if sc_score < 1 or sc_score > 10:
@@ -578,11 +579,18 @@ def find_best_clips_context(video_path, movie_title,
     print(f"  Movie duration: {_format_time(total_duration)} ({total_duration:.0f}s)")
     print(f"  {len(blocks)} blocks with transcription")
 
-    # Step 1.5: Merge small blocks into super-blocks for LLM to work with
+    # Step 1.5: Merge small blocks into super-blocks for LLM to work with.
+    # Blocks must be comfortably larger than the requested max clip length —
+    # a clip can never be selected past its own block's end (see
+    # _validate_sub_clips's "outside block bounds" check) — so a fixed
+    # 120-150s super-block silently capped every clip at ~75s regardless of
+    # the max_duration the user asked for.
     before_merge = len(blocks)
-    blocks = _merge_blocks_for_llm(blocks)
+    super_target = max(120, max_duration + 40)
+    super_cap = super_target + 30
+    blocks = _merge_blocks_for_llm(blocks, target_duration=super_target, max_duration=super_cap)
     print(f"  Merged {before_merge} → {len(blocks)} super-blocks "
-          f"(target 120s, range 90-150s)")
+          f"(target {super_target}s, range {super_target - 30}-{super_cap}s)")
 
     # Step 1.6: Filter out silent / credits / music blocks
     before_filter = len(blocks)
@@ -638,6 +646,9 @@ def find_best_clips_context(video_path, movie_title,
         prompt = batch_template.format(
             movie_name=movie_title,
             blocks_text=blocks_text,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            pref_duration=(min_duration + max_duration) // 2,
         )
 
         # T4: adaptive max_tokens
@@ -690,7 +701,13 @@ def find_best_clips_context(video_path, movie_title,
                         f"Cut count: {cc} (high = action)\n"
                         f"Dialogue pauses: {pp}"
                     )
-                sub_prompt = batch_template.format(movie_name=movie_title, blocks_text="\n\n".join(sub_texts))
+                sub_prompt = batch_template.format(
+                    movie_name=movie_title,
+                    blocks_text="\n\n".join(sub_texts),
+                    min_duration=min_duration,
+                    max_duration=max_duration,
+                    pref_duration=(min_duration + max_duration) // 2,
+                )
                 sub_raw = None
                 try:
                     sub_raw = call_llm(sub_prompt, max_tokens=_max_tokens_for(len(sub_blocks)))
@@ -728,7 +745,8 @@ def find_best_clips_context(video_path, movie_title,
             block_clips = batch_clips.get(i, [])
 
             # Validate — batch clips have absolute timestamps, so pass block_start=0
-            valid_clips = _validate_sub_clips(block_clips, 0, block_end, block_dur) if block_clips else []
+            valid_clips = _validate_sub_clips(block_clips, 0, block_end, block_dur,
+                                              min_duration, max_duration) if block_clips else []
             for vc in valid_clips:
                 vc["text"] = dialogue
 
@@ -746,9 +764,9 @@ def find_best_clips_context(video_path, movie_title,
                         reasons = []
                         if sc_start < block_start or sc_end > block_end:
                             reasons.append("out_of_bounds")
-                        if sc_dur < 20 and sc_reason != "self_contained":
+                        if sc_dur < min_duration and sc_reason != "self_contained":
                             reasons.append(f"too_short({sc_dur:.0f}s)")
-                        if sc_dur > 75:
+                        if sc_dur > max_duration:
                             reasons.append(f"too_long({sc_dur:.0f}s)")
                         if sc_score < 1 or sc_score > 10:
                             reasons.append(f"bad_score({sc_score})")

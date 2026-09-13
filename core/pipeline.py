@@ -296,7 +296,10 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 "Missing subtitles: subtitle SRT could not be generated."
             )
 
-        # Step 5: Blurred background → full 9:16 output
+        # Step 5: Blurred background → full 9:16 output.
+        # background_source=vertical_clip (pre-subtitle) so the blurred
+        # backdrop never contains a blurred "ghost" of the subtitles — only
+        # the sharp foreground (subtitled_clip) shows them.
         if blur_enabled:
             print("[5/5] Adding blurred background...")
             blur_background(
@@ -306,6 +309,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 banner_top=banner_top,
                 banner_bottom=banner_bottom,
                 gpu_opts=gpu_opts,
+                background_source=vertical_clip,
             )
         else:
             print("[5/5] Padding to full frame (no blur)...")

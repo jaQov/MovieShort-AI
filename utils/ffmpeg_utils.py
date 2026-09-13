@@ -296,25 +296,39 @@ def blur_background(
     banner_top: int = BANNER_TOP,
     banner_bottom: int = BANNER_BOTTOM,
     gpu_opts=None,
+    background_source: Optional[Union[str, Path]] = None,
 ) -> Path:
     """Blurred background effect: fills 1080×1920 with blurred video, clear fg centered.
 
-    Takes a content-area video (1080 × content_h with subtitles already embedded)
+    Takes a content-area video (1080 × content_h, subtitles already embedded)
     and produces a full 9:16 frame where:
-    - Background: the same video scaled to fill 1080×1920 and heavily blurred
-    - Foreground: the original clear video centered in the content area
+    - Background: `background_source` (or `video_path` if not given) scaled to
+      fill 1080×1920 and heavily blurred
+    - Foreground: `video_path`, unblurred, centered in the content area
+
+    IMPORTANT: pass the pre-subtitle clip as `background_source` when the
+    caller has one. Blurring `video_path` itself for the background (the old
+    behavior — always true before `background_source` existed) blurs
+    whatever is burned into it, subtitles included, and since the blurred
+    layer fills the full 1080×1920 frame while the sharp foreground only
+    covers the content-area band, a smeared "ghost" copy of the subtitles
+    peeks out around the edges of the sharp copy — visibly a second,
+    blurred subtitle on top of the real one.
 
     When enabled=False, just copies the input (no blur effect).
     """
     _validate_file(video_path, "video_path")
+    if background_source is not None:
+        _validate_file(background_source, "background_source")
     out = Path(output_path)
     if not enabled:
         shutil.copy2(str(video_path), str(out))
         return out
+    bg_source = background_source if background_source is not None else video_path
     filter_complex = (
         "[0:v]scale={}:{}:force_original_aspect_ratio=increase,"
         "crop={}:{},boxblur=20:5[bg];"
-        "[bg][0:v]overlay=0:{}"
+        "[bg][1:v]overlay=0:{}[vout]"
     ).format(VERTICAL_WIDTH, VERTICAL_HEIGHT,
              VERTICAL_WIDTH, VERTICAL_HEIGHT,
              banner_top)
@@ -323,8 +337,11 @@ def blur_background(
     if gpu:
         cmd.extend(gpu)
     cmd.extend([
+        "-i", str(bg_source),
         "-i", str(video_path),
         "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "1:a?",
         "-c:a", "copy",
         str(out),
     ])
@@ -487,11 +504,13 @@ def render_full_preview(
                 fontsdir=os.path.abspath(FONTS_DIR))
             content_src = tmp_subs
 
-        # Step 3: full 9:16 frame
+        # Step 3: full 9:16 frame. background_source=tmp_vert (pre-subtitle)
+        # so the blurred backdrop doesn't carry a blurred copy of the
+        # subtitles alongside the sharp foreground's real ones.
         if blur:
             blur_background(content_src, out_mp4, enabled=True,
                             banner_top=banner_top, banner_bottom=banner_bottom,
-                            gpu_opts=gpu_opts)
+                            gpu_opts=gpu_opts, background_source=tmp_vert)
         else:
             pad_with_banners(content_src, out_mp4,
                              banner_top=banner_top, banner_bottom=banner_bottom,

@@ -1766,7 +1766,7 @@ def create_app() -> gr.Blocks:
                         label=_t("min_len", ui_lang)
                     )
                     max_dur2 = gr.Slider(
-                        minimum=30, maximum=120,
+                        minimum=30, maximum=180,
                         value=cfg.get("max_duration", 60),
                         label=_t("max_len", ui_lang)
                     )

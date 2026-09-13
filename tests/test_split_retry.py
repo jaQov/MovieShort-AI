@@ -29,7 +29,7 @@ def test_split_retry_on_null_batch(monkeypatch):
     """Batch 4 returns None, halves return valid JSON → merged with index correction."""
     blocks4 = _make_blocks(4)
     # prevent merging/filtering/batching side effects
-    monkeypatch.setattr(cb, "_merge_blocks_for_llm", lambda x: x)
+    monkeypatch.setattr(cb, "_merge_blocks_for_llm", lambda x, *a, **kw: x)
     monkeypatch.setattr(cb, "_is_credit_or_silent", lambda b: False)
     monkeypatch.setattr(cb, "_split_batches", lambda blocks, bs, budget: [blocks])
 
@@ -38,7 +38,7 @@ def test_split_retry_on_null_batch(monkeypatch):
 
     # validation: accept any clips (bypass duration/score checks by patching)
     # Actually _validate_sub_clips is used; let it pass through — our clips are 30s duration within bounds
-    monkeypatch.setattr(cb, "_validate_sub_clips", lambda clips, s, e, d: clips)
+    monkeypatch.setattr(cb, "_validate_sub_clips", lambda clips, s, e, d, *a, **kw: clips)
     monkeypatch.setattr(cb, "_deduplicate_clips", lambda clips: sorted(clips, key=lambda c: c["start"]))
 
     calls = []
@@ -78,7 +78,7 @@ def test_split_retry_on_null_batch(monkeypatch):
 def test_single_block_null_no_loop(monkeypatch):
     """Single block null → no split, fallback to smart centering."""
     blocks1 = _make_blocks(1)
-    monkeypatch.setattr(cb, "_merge_blocks_for_llm", lambda x: x)
+    monkeypatch.setattr(cb, "_merge_blocks_for_llm", lambda x, *a, **kw: x)
     monkeypatch.setattr(cb, "_is_credit_or_silent", lambda b: False)
     monkeypatch.setattr(cb, "_split_batches", lambda blocks, bs, budget: [blocks])
     monkeypatch.setattr("analyzers.scene_analyzer.detect_and_transcribe", lambda *a, **kw: blocks1)
