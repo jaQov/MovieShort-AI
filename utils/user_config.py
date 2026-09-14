@@ -12,7 +12,7 @@ CONFIG_PATH = os.path.join(
 DEFAULT_CONFIG = {
     "movie_title": "",
     "num_clips": 10,
-    # min/max clip duration are a fixed 60-180s rule (config.py), not
+    # min/max clip duration are a fixed 120-180s rule (config.py), not
     # user-configurable — no key here.
     "subtitles": True,
     "face_tracking": True,

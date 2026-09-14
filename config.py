@@ -20,9 +20,12 @@ FORCE_CPU = False                # True = force CPU even if GPU available
 WHISPER_BEAM_SIZE = 5            # Beam size for transcription accuracy
 
 # Video processing defaults — fixed rule, not user-configurable: every
-# generated clip must be 1-3 minutes long.
+# generated clip must be 2-3 minutes long. (Raised from 1-3 min: the LLM
+# kept defaulting to the minimum instead of treating it as a floor, so
+# min=60 was producing a pile of exactly-60s clips — 120 makes the actual
+# floor match what "2-3 minutes" is supposed to mean.)
 DEFAULT_MAX_CLIP_DURATION = 180  # seconds
-DEFAULT_MIN_CLIP_DURATION = 60   # seconds
+DEFAULT_MIN_CLIP_DURATION = 120  # seconds
 VERTICAL_WIDTH = 1080
 VERTICAL_HEIGHT = 1920
 
@@ -32,8 +35,11 @@ BANNER_BOTTOM = 300              # pixels
 
 # Face tracking
 FACE_TRACKING_INTERVAL = 5       # Analyze every Nth frame
-PERSON_SCAN_TIMEOUT_SECONDS = 120  # Give up and center-crop if the per-clip
-                                    # face/person scan takes longer than this
+# No timeout on the per-clip face/person scan (see core/processor.py's
+# apply_vertical_crop): a clip that gives up early and falls back to a
+# plain center crop is worse than useless, so the scan always runs to
+# completion no matter how long it takes. A plain center crop only
+# happens now when the scan genuinely finds nobody in the whole clip.
 
 # Scene detection
 SCENE_THRESHOLD = 27.0

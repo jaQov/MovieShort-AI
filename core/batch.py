@@ -71,7 +71,7 @@ def process_movie(video_path, settings=None):
         video_path: path to movie file
         settings: dict with keys:
             - max_duration / min_duration: not accepted from the GUI —
-              every clip is a fixed 60-180s, see config.DEFAULT_MIN/MAX_CLIP_DURATION.
+              every clip is a fixed 120-180s, see config.DEFAULT_MIN/MAX_CLIP_DURATION.
             - subtitles (bool): enable subtitles (default True)
             - face_tracking (bool): enable face tracking (default True)
             - subtitle_path (str): external subtitle file (required)

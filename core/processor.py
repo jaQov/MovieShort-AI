@@ -9,7 +9,6 @@ import time as time_module
 import json
 import os
 import subprocess
-from concurrent.futures import TimeoutError as _CFTimeoutError
 
 import cv2
 import numpy as np
@@ -857,40 +856,6 @@ def _get_clip_duration(video_path: str) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _center_crop_ffmpeg(video_path, output_path, progress_callback=None,
-                        anti_copyright=True, banner_top=None, banner_bottom=None):
-    """Scale-to-fill content area (no banner padding, no face tracking)."""
-    import subprocess
-    bt = banner_top if banner_top is not None else config.BANNER_TOP
-    bb = banner_bottom if banner_bottom is not None else config.BANNER_BOTTOM
-    content_h = config.VERTICAL_HEIGHT - bt - bb
-    ac_filters = []
-    if anti_copyright:
-        if config.AC_MIRROR:
-            ac_filters.append("hflip")
-        if config.AC_CONTRAST != 1.0 or config.AC_BRIGHTNESS != 0.0 or config.AC_SATURATION != 1.0:
-            ac_filters.append(
-                f"eq=contrast={config.AC_CONTRAST}:"
-                f"brightness={config.AC_BRIGHTNESS}:"
-                f"saturation={config.AC_SATURATION}"
-            )
-    ac_part = "," + ",".join(ac_filters) if ac_filters else ""
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path,
-         "-vf",
-         f"scale={config.VERTICAL_WIDTH}:{content_h}:force_original_aspect_ratio=increase,"
-         f"crop={config.VERTICAL_WIDTH}:{content_h}"
-         f"{ac_part}",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-         "-c:a", "copy", output_path],
-        check=True, capture_output=True, timeout=120,
-    )
-    if progress_callback:
-        progress_callback(1.0)
-    return {"output_size": (config.VERTICAL_WIDTH, content_h),
-            "faces_found": 0}
-
-
 def apply_vertical_crop(
     video_path: str,
     output_path: str,
@@ -918,37 +883,17 @@ def apply_vertical_crop(
     if progress_callback:
         progress_callback(0.05)
 
-    # Person analysis with timeout — try cache first.
+    # Person analysis — try cache first, otherwise scan the clip.
     #
-    # IMPORTANT: the pool is NOT used as a context manager here. Exiting a
-    # `with ThreadPoolExecutor(...)` block calls shutdown(wait=True), which
-    # blocks until the submitted task actually finishes — so a naive
-    # `with ... : ... except TimeoutError: return fallback` still pays the
-    # full analysis time before returning, it just discards the result.
-    # shutdown(wait=False) lets us bail out immediately on timeout while the
-    # scan finishes harmlessly in the background (its cache write targets a
-    # temp clip file that gets deleted right after this call anyway).
+    # Deliberately NO timeout here: a clip that gives up early and falls
+    # back to a plain center crop is worse than useless (the whole point of
+    # this feature), so the scan always runs to completion no matter how
+    # long it takes. The only remaining path to a plain center crop is
+    # genuinely finding nobody in the whole clip (faces_found == 0 below) —
+    # that's a real "nothing to track" case, not a patience problem.
     person_data = _load_person_cache(video_path)
     if person_data is None:
-        from concurrent.futures import ThreadPoolExecutor
-        pool = ThreadPoolExecutor(max_workers=1)
-        # analyze_persons() runs in a brand-new OS thread, which does NOT
-        # inherit this thread's clip label — pass it through explicitly so
-        # its progress lines still show which clip they belong to.
-        fut = pool.submit(analyze_persons, video_path, log_label=get_clip_label())
-        scan_timeout = getattr(config, "PERSON_SCAN_TIMEOUT_SECONDS", 30)
-        try:
-            person_data = fut.result(timeout=scan_timeout)
-            pool.shutdown(wait=False)
-        except _CFTimeoutError:
-            log(f"  ⚠ Face/person scan took longer than {scan_timeout}s — "
-                "giving up on it and using a plain center crop for this "
-                "clip instead (the scan keeps running in the background "
-                "but its result won't be used)")
-            pool.shutdown(wait=False)
-            return _center_crop_ffmpeg(video_path, output_path, progress_callback,
-                                       anti_copyright=anti_copyright,
-                                       banner_top=banner_top, banner_bottom=banner_bottom)
+        person_data = analyze_persons(video_path, log_label=get_clip_label())
 
     if progress_callback:
         progress_callback(0.5)

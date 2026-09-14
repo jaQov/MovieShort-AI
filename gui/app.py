@@ -953,7 +953,7 @@ UI = {
         "auto_process": "Analyze & process queue",
         "file_label": "Select video file",
         "movie_title": "Movie title (optional)",
-        "clip_length_rule": "Every generated clip is 1-3 minutes long (fixed).",
+        "clip_length_rule": "Every generated clip is 2-3 minutes long (fixed).",
         "section_upload": "🎬 Movie & Subtitles",
         "section_queue": "🗂️ Processing Queue",
         "section_clip_settings": "🎯 Clip Settings",
@@ -1460,7 +1460,7 @@ def create_app() -> gr.Blocks:
                 _font_style2 = {"font": _font_family2, "size": int(sub_size) if sub_size is not None else 13, "color": _cval2, "outline": int(sub_outline) if sub_outline is not None else 1, "bold": bool(sub_bold), "italic": bool(sub_italic), "shadow": bool(sub_shadow), "position_y": int(sub_position) if sub_position is not None else 400}
                 settings = {
                     # min/max duration intentionally omitted — fixed
-                    # 60-180s rule from config.DEFAULT_MIN/MAX_CLIP_DURATION,
+                    # 120-180s rule from config.DEFAULT_MIN/MAX_CLIP_DURATION,
                     # not user-configurable.
                     "subtitles": subs,
                     "face_tracking": face,
