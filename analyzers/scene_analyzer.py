@@ -369,15 +369,22 @@ def merge_short_scenes(
 def detect_and_transcribe(
     video_path,
     language=None,
-    subtitle_path=None,
+    sdh_subtitle_path=None,
 ):
     """
-    Detect scenes and map an external subtitle file onto those scenes.
+    Detect scenes and map an external SDH subtitle file onto those scenes.
 
     IMPORTANT:
         Whisper is intentionally NOT used.
 
-    External subtitles are mandatory for the automatic movie pipeline.
+    An SDH (Subtitles for the Deaf and Hard-of-hearing) subtitle file is
+    mandatory here — not the plain dialogue-only subtitle file. SDH cues
+    include bracketed sound/action cues ([gunshot], [door slams]) and
+    speaker labels that plain subtitles omit, which gives the AI real
+    signal about what's happening even in dialogue-free stretches. The
+    plain subtitle file is used elsewhere, only for burning captions into
+    the final rendered clip — SDH tags like "[grunting]" should never end
+    up as a visible caption.
 
     Supported subtitle formats:
 
@@ -395,8 +402,10 @@ def detect_and_transcribe(
             It is not used for transcription because transcription is
             performed from the supplied external subtitle file.
 
-        subtitle_path:
-            Optional explicit subtitle path.
+        sdh_subtitle_path:
+            Required explicit path to the SDH subtitle file. There is no
+            fallback/auto-discovery — a missing or invalid path always
+            raises rather than silently guessing a file next to the video.
 
     Returns:
         List of scene blocks:
@@ -426,19 +435,18 @@ def detect_and_transcribe(
     # without subtitles fails immediately instead of spending several
     # minutes analyzing the video.
     # ------------------------------------------------------------------
-    resolved_subtitle_path = find_external_subtitle(
+    resolved_sdh_subtitle_path = find_external_subtitle(
         video_path,
-        explicit_path=subtitle_path,
+        explicit_path=sdh_subtitle_path,
     )
 
-    if not resolved_subtitle_path:
+    if not resolved_sdh_subtitle_path:
         raise RuntimeError(
-            "Missing subtitles: no .srt, .ass, .ssa "
-            "or .vtt subtitle file was found for "
-            "this movie."
+            "Missing subtitles: no SDH subtitle file (.srt, .ass, .ssa "
+            "or .vtt) was provided for this movie."
         )
 
-    subtitle_path = resolved_subtitle_path
+    sdh_subtitle_path = resolved_sdh_subtitle_path
 
     print()
     print("=" * 50)
@@ -447,7 +455,7 @@ def detect_and_transcribe(
 
     print(
         f"  Using subtitles: "
-        f"{os.path.basename(subtitle_path)}"
+        f"{os.path.basename(sdh_subtitle_path)}"
     )
 
     # ------------------------------------------------------------------
@@ -456,7 +464,7 @@ def detect_and_transcribe(
     try:
         subtitle_segments = (
             load_external_subtitles(
-                subtitle_path
+                sdh_subtitle_path
             )
         )
 
@@ -469,7 +477,7 @@ def detect_and_transcribe(
     if not subtitle_segments:
         raise RuntimeError(
             "Missing subtitles: "
-            f"{os.path.basename(subtitle_path)} "
+            f"{os.path.basename(sdh_subtitle_path)} "
             "contains no usable subtitle cues."
         )
 
@@ -696,8 +704,8 @@ def detect_and_transcribe(
 
         hash_input = (
             f"{video_path}_"
-            f"{subtitle_path}_"
-            f"{os.path.getmtime(subtitle_path)}"
+            f"{sdh_subtitle_path}_"
+            f"{os.path.getmtime(sdh_subtitle_path)}"
         )
 
         file_hash = hashlib.md5(
@@ -707,7 +715,7 @@ def detect_and_transcribe(
         cache_path = (
             Path(config.CACHE_DIR)
             / (
-                f"full_transcript_"
+                f"full_transcript_sdh_"
                 f"{video_basename}_"
                 f"{file_hash}.json"
             )

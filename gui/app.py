@@ -955,6 +955,7 @@ UI = {
         "movie_title": "Movie title (optional)",
         "clip_length_rule": "Every generated clip is 2-3 minutes long (fixed).",
         "section_upload": "🎬 Movie & Subtitles",
+        "section_context": "🧠 Background Knowledge",
         "section_queue": "🗂️ Processing Queue",
         "section_clip_settings": "🎯 Clip Settings",
         "processing_opts": "⚙️ Processing Options",
@@ -973,7 +974,18 @@ UI = {
         "score_threshold_info": "Minimum scene score (1-10) to include in results",
         "waiting": "Waiting...",
         "error_no_file": "Error: please upload a video file.",
-        "subtitle_file_label": "Subtitle file (.srt/.ass/.ssa/.vtt)",
+        "srt_file_label": "Plain subtitle file (.srt/.ass/.ssa/.vtt) — burned into the clip",
+        "sdh_file_label": "SDH subtitle file — used only for AI analysis, never burned in",
+        "series_context_label": "Series background",
+        "series_context_placeholder": "Genre/premise, central conflict, main recurring characters. Spoilers OK. Paste the result of the Series prompt here.",
+        "season_context_label": "Season background",
+        "season_context_placeholder": "This season's arc, characters active this season, ongoing threads. Spoilers OK. Paste the result of the Season prompt here.",
+        "episode_context_label": "Episode background (spoilers OK)",
+        "episode_context_placeholder": "Beat-by-beat plot of this episode, standout moments, whether it's a finale/reveal. Full spoilers expected. Paste the result of the Episode prompt here.",
+        "val_missing_video": "video file",
+        "val_missing_srt": "plain subtitle file",
+        "val_missing_sdh": "SDH subtitle file",
+        "val_cant_add": "Can't add to queue — missing",
         "console": "Debug console",
         "subtitle_editor": "Subtitle Editor",
         "font": "Font",
@@ -1319,19 +1331,41 @@ def create_app() -> gr.Blocks:
                 pass
             auto_file.change(fn=_on_auto_upload, inputs=auto_file, outputs=auto_upload_progress)
             auto_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=auto_upload_progress)
-            auto_subtitle_file = gr.File(
-                label=_t("subtitle_file_label", ui_lang),
+            auto_srt_file = gr.File(
+                label=_t("srt_file_label", ui_lang),
                 file_types=[".srt", ".ass", ".ssa", ".vtt"],
-                elem_id="auto-subtitle-file",
+                elem_id="auto-srt-file",
             )
-            with gr.Row():
-                movie_title_box = gr.Textbox(
-                    label=_t("movie_title", ui_lang),
-                    placeholder=_t("movie_placeholder", ui_lang),
-                    scale=3,
-                )
-                add_queue_btn = gr.Button("➕ " + _t("add_to_queue", ui_lang),
-                    variant="secondary", scale=1, elem_id="add-queue-btn")
+            auto_sdh_file = gr.File(
+                label=_t("sdh_file_label", ui_lang),
+                file_types=[".srt", ".ass", ".ssa", ".vtt"],
+                elem_id="auto-sdh-file",
+            )
+            movie_title_box = gr.Textbox(
+                label=_t("movie_title", ui_lang),
+                placeholder=_t("movie_placeholder", ui_lang),
+            )
+
+        with gr.Group():
+            gr.Markdown(f"### {_t('section_context', ui_lang)}")
+            series_context_box = gr.Textbox(
+                label=_t("series_context_label", ui_lang),
+                placeholder=_t("series_context_placeholder", ui_lang),
+                lines=3,
+            )
+            season_context_box = gr.Textbox(
+                label=_t("season_context_label", ui_lang),
+                placeholder=_t("season_context_placeholder", ui_lang),
+                lines=3,
+            )
+            episode_context_box = gr.Textbox(
+                label=_t("episode_context_label", ui_lang),
+                placeholder=_t("episode_context_placeholder", ui_lang),
+                lines=4,
+            )
+            add_queue_btn = gr.Button("➕ " + _t("add_to_queue", ui_lang), variant="secondary",
+                elem_id="add-queue-btn")
+            queue_add_status = gr.HTML(value="")
 
         with gr.Group():
             gr.Markdown(f"### {_t('section_queue', ui_lang)}")
@@ -1343,35 +1377,54 @@ def create_app() -> gr.Blocks:
             items = ""
             for i, item in enumerate(q):
                 title_part = f" — {item['title']}" if item.get("title") else ""
-                sub_part = " 📝" if item.get("subtitle_path") else " ⚠️ no subtitles"
+                has_subs = item.get("srt_path") and item.get("sdh_path")
+                sub_part = " 📝 SRT+SDH" if has_subs else " ⚠️ missing subtitles"
+                ctx_count = sum(1 for k in ("series_context", "season_context", "episode_context") if item.get(k))
+                ctx_part = f" 🧠 {ctx_count}/3" if ctx_count else ""
                 items += f'<div style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;align-items:center">'
                 items += f'<span style="margin-right:8px;font-weight:bold;color:#D4A27F">{i+1}.</span>'
-                items += f'<span>📁 {item["name"]}{title_part}{sub_part}</span></div>'
+                items += f'<span>📁 {item["name"]}{title_part}{sub_part}{ctx_part}</span></div>'
             n = len(q)
             label = _t("queue_header", ui_lang).format(n=n)
             return f'<div style="border:1px solid rgba(255,255,255,0.12);border-radius:10px;max-height:200px;overflow-y:auto;background:rgba(26,24,20,0.5)"><div style="padding:6px 10px;background:rgba(255,255,255,0.06);font-weight:bold;border-bottom:1px solid rgba(255,255,255,0.12)">{label}</div>{items}</div>'
 
-        def _add_to_queue(q, file, subtitle_upload, title):
+        def _add_to_queue(q, file, srt_upload, sdh_upload, title, series_ctx, season_ctx, episode_ctx):
+            missing = []
             if file is None:
-                return q, _render_queue(q), None, None, title
+                missing.append(_t("val_missing_video", ui_lang))
+            if srt_upload is None:
+                missing.append(_t("val_missing_srt", ui_lang))
+            if sdh_upload is None:
+                missing.append(_t("val_missing_sdh", ui_lang))
+            if missing:
+                warn = ('<span style="color:#fbbf24">⚠️ ' + _t("val_cant_add", ui_lang)
+                        + ": " + ", ".join(missing) + '</span>')
+                return (q, _render_queue(q), gr.update(), gr.update(), gr.update(),
+                        gr.update(), gr.update(), gr.update(), gr.update(), warn)
             import os
             fpath = file.name if hasattr(file, "name") else str(file)
-            sub_path = None
-            if subtitle_upload is not None:
-                sub_path = subtitle_upload.name if hasattr(subtitle_upload, "name") else str(subtitle_upload)
+            srt_path = srt_upload.name if hasattr(srt_upload, "name") else str(srt_upload)
+            sdh_path = sdh_upload.name if hasattr(sdh_upload, "name") else str(sdh_upload)
             new_item = {
                 "path": fpath,
                 "title": title or "",
                 "name": os.path.basename(fpath),
-                "subtitle_path": sub_path,
+                "srt_path": srt_path,
+                "sdh_path": sdh_path,
+                "series_context": (series_ctx or "").strip(),
+                "season_context": (season_ctx or "").strip(),
+                "episode_context": (episode_ctx or "").strip(),
             }
             new_q = list(q or []) + [new_item]
-            return new_q, _render_queue(new_q), None, None, ""
+            return (new_q, _render_queue(new_q), None, None, None, "", "", "", "", "")
 
         add_queue_btn.click(
             fn=_add_to_queue,
-            inputs=[queue_state, auto_file, auto_subtitle_file, movie_title_box],
-            outputs=[queue_state, queue_display, auto_file, auto_subtitle_file, movie_title_box],
+            inputs=[queue_state, auto_file, auto_srt_file, auto_sdh_file, movie_title_box,
+                    series_context_box, season_context_box, episode_context_box],
+            outputs=[queue_state, queue_display, auto_file, auto_srt_file, auto_sdh_file,
+                     movie_title_box, series_context_box, season_context_box, episode_context_box,
+                     queue_add_status],
         ).then(fn=lambda: gr.update(value="", visible=False), inputs=[], outputs=[auto_upload_progress])
         with gr.Group():
             gr.Markdown(f"### {_t('section_clip_settings', ui_lang)}")
@@ -1448,7 +1501,11 @@ def create_app() -> gr.Blocks:
             for file_idx, item in enumerate(queue):
                 video_path = item["path"]
                 movie_title = item.get("title", "")
-                subtitle_path = item.get("subtitle_path")
+                srt_subtitle_path = item.get("srt_path")
+                sdh_subtitle_path = item.get("sdh_path")
+                series_context = item.get("series_context", "")
+                season_context = item.get("season_context", "")
+                episode_context = item.get("episode_context", "")
 
                 # subtitle style (R7b-7) — Editor controls flow to pipeline
                 _cmap2 = {"White": "&H00FFFFFF", "Yellow": "&H0000FFFF", "Black": "&H00000000", "Red": "&H000000FF", "Cyan": "&H00FFFF00", "Green": "&H0000FF00"}
@@ -1471,7 +1528,11 @@ def create_app() -> gr.Blocks:
                     "num_clips": n_clips,
                     "score_threshold": s_thresh,
                     "movie_title": movie_title,
-                    "subtitle_path": subtitle_path,
+                    "srt_subtitle_path": srt_subtitle_path,
+                    "sdh_subtitle_path": sdh_subtitle_path,
+                    "series_context": series_context,
+                    "season_context": season_context,
+                    "episode_context": episode_context,
                     "auto_cleanup": cleanup,
                     "subtitle_font_name": sub_font_name,
                     "subtitle_font": _font_family2,
@@ -1496,8 +1557,11 @@ def create_app() -> gr.Blocks:
                 if movie_title:
                     print(f"{_t('movie_title', _lang)}: {movie_title}")
                 print("LLM: local Ollama model")
-                if not subtitle_path:
-                    print("⚠️ No subtitle file attached — relying on automatic discovery next to the video file.")
+                print(f"Subtitles: {os.path.basename(srt_subtitle_path)} (captions), "
+                      f"{os.path.basename(sdh_subtitle_path)} (SDH, analysis)")
+                ctx_filled = sum(1 for c in (series_context, season_context, episode_context) if c)
+                if ctx_filled:
+                    print(f"Background knowledge: {ctx_filled}/3 context field(s) provided")
                 print()
 
                 results_container = []

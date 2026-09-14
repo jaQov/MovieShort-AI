@@ -205,6 +205,7 @@ def check_ollama() -> dict:
 PROMPT_BATCH_TO_CLIPS = (
     "You are an expert at cutting movie blocks into YouTube Shorts.\n"
     "Movie: «{movie_name}»\n\n"
+    "{context_block}"
     "Below are scene blocks. Each has a Dialogue line (from subtitles) AND "
     "a Visual line (a one-sentence description from a computer-vision "
     "model that looked at a sample frame from the block). For EACH block, "
@@ -213,6 +214,11 @@ PROMPT_BATCH_TO_CLIPS = (
     "{blocks_text}\n"
     "---\n\n"
     "Rules (per block):\n"
+    "- Use any background info given above (series/season/episode context, "
+    "  plot summary) to judge what actually matters — a block can be a great\n"
+    "  clip because of WHO is talking or WHAT it means in the story, even if "
+    "  the dialogue alone looks ordinary. Recognize named characters, running\n"
+    "  plot threads, and known dramatic moments from that background info.\n"
     "- Judge each block on BOTH Dialogue AND Visual — do not dismiss a "
     "  block just because Dialogue is empty or short. A block with little\n"
     "  or no dialogue can still be an excellent clip if Visual describes "
@@ -236,6 +242,66 @@ PROMPT_BATCH_TO_CLIPS = (
     ' {{"start": 130.0, "end": 185.0, "title": "Tower talk", "score": 7.0,\n'
     '  "reason": "dialogue", "block": 1}}]'
 )
+
+
+# ---------------------------------------------------------------------------
+# Auto-generated story primer — one call per movie, grounds every batch call
+# ---------------------------------------------------------------------------
+
+PROMPT_STORY_PRIMER = (
+    "You are given the full SDH subtitle transcript of a movie/episode "
+    "(SDH includes bracketed sound/action cues like [gunshot], [door "
+    "slams], and speaker labels, not just spoken dialogue).\n"
+    "Title: «{movie_name}»\n\n"
+    "--- TRANSCRIPT ---\n"
+    "{transcript_text}\n"
+    "--- END TRANSCRIPT ---\n\n"
+    "Summarize this in under 200 words, covering:\n"
+    "- A short plot summary of what actually happens, in order\n"
+    "- Main characters that appear, with a one-line role for each\n"
+    "- 2-4 moments that sound like the most dramatic/emotional peaks\n\n"
+    "Write dense, factual background for another AI to use as context — not "
+    "a review, no marketing language. Output only the summary itself, no "
+    "preamble, no headers."
+)
+
+
+def generate_story_primer(transcript_text: str, movie_title: str) -> str:
+    """One extra LLM call, made once per movie/episode before clip scoring
+    starts: summarizes the ACTUAL SDH transcript into a short plot/character
+    primer, so every batch call gets real narrative grounding instead of
+    judging each block in total isolation.
+
+    Grounded in real transcript text (not the model's own training-data
+    guesses about the title), so hallucination risk stays low — worst case
+    it writes a mediocre summary, it shouldn't invent characters or events
+    that aren't in the transcript.
+
+    Never raises: on any failure (empty transcript, LLM error) this returns
+    "" and clip scoring proceeds without it, exactly like before this
+    feature existed.
+    """
+    transcript_text = (transcript_text or "").strip()
+    if not transcript_text:
+        return ""
+
+    # Bound input size the same way batch prompts are bounded (T5) — a very
+    # long transcript gets truncated rather than blowing the context budget.
+    # Proportional/chunked summarization could replace this for extremely
+    # long movies, but a flat cap is enough for a typical episode/movie.
+    ctx = getattr(config, "OLLAMA_NUM_CTX", 8192)
+    budget_chars = int(ctx * config.PROMPT_CHARS_PER_TOKEN * config.PROMPT_INPUT_BUDGET)
+    text = transcript_text[:budget_chars]
+
+    prompt = PROMPT_STORY_PRIMER.format(movie_name=movie_title, transcript_text=text)
+
+    try:
+        result = call_llm(prompt, max_tokens=600)
+        return (result or "").strip()
+    except Exception as e:
+        print(f"  ⚠️ Couldn't auto-generate a story primer from the transcript "
+              f"({e}) — continuing without it")
+        return ""
 
 
 def _parse_batch_response(raw: str, block_start_times: list[float]) -> dict[int, list[dict]]:

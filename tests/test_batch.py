@@ -3,6 +3,7 @@ import pytest
 from core.batch import _snap_scene_boundary, _diversity_filter, _deduplicate_clips
 from core.batch import _resolve_movie_title
 from core.batch import _is_credit_or_silent
+from core.batch import _build_context_block
 
 
 def test_snap_to_sentence_end():
@@ -327,3 +328,57 @@ def test_mostly_silent_audio_rescued_by_visual():
         "audio_peaks": {"silence_ratio": 0.95},
     }
     assert _is_credit_or_silent(block) is False
+
+
+def test_sdh_sound_cue_rescues_silent_block_without_visual():
+    """A bracketed SDH sound cue alone (no visual analysis, no dialogue) is
+    enough to survive the filter — it's real signal on its own."""
+    block = {
+        "text": "[gunshot]",
+        "audio_peaks": {"silence_ratio": 0.9},
+    }
+    assert _is_credit_or_silent(block) is False
+
+
+def test_plain_short_text_without_brackets_still_dropped():
+    """Short plain text with no brackets, no visual, no audio — still filtered."""
+    block = {
+        "text": "Okay.",
+        "audio_peaks": {"silence_ratio": 0.9},
+    }
+    assert _is_credit_or_silent(block) is True
+
+
+# ---------------------------------------------------------------------------
+# _build_context_block — series/season/episode fields + auto-primer
+# ---------------------------------------------------------------------------
+
+def test_context_block_empty_when_nothing_supplied():
+    assert _build_context_block("", "", "", "") == ""
+
+
+def test_context_block_includes_all_supplied_parts():
+    block = _build_context_block(
+        "A sci-fi thriller about a silo.",
+        "Season 1 follows Juliette.",
+        "The finale — Bernard is revealed as the villain.",
+        "Auto summary of the transcript.",
+    )
+    assert "Series background: A sci-fi thriller about a silo." in block
+    assert "Season background: Season 1 follows Juliette." in block
+    assert "Episode background: The finale" in block
+    assert "Auto summary of the transcript." in block
+
+
+def test_context_block_omits_blank_fields():
+    block = _build_context_block("", "Season info only.", "", "")
+    assert "Series background" not in block
+    assert "Season background: Season info only." in block
+    assert "Episode background" not in block
+
+
+def test_context_block_caps_each_field_length():
+    huge = "x" * 5000
+    block = _build_context_block(huge, "", "", "")
+    # capped well under the raw 5000 chars
+    assert len(block) < 1000

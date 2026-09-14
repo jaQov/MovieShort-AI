@@ -335,75 +335,30 @@ def find_external_subtitle(
     explicit_path=None,
 ):
     """
-    Find an external subtitle file for a movie.
+    Validate an explicitly-supplied external subtitle file.
 
-    Priority:
+    IMPORTANT:
+    There is deliberately NO filename-guessing fallback here (no matching
+    against the movie's filename, no language-suffix search next to the
+    video). Both the SDH and plain subtitle files are required uploads from
+    the GUI — silently falling back to a guessed file next to the video
+    would risk pairing the wrong subtitle track with a movie without any
+    clear error, so a missing/invalid path is always a hard failure instead.
 
-    1. Explicit subtitle path supplied by the user.
-    2. Exact movie filename:
-           movie.srt
-           movie.ass
-           movie.ssa
-           movie.vtt
-    3. Common English suffixes:
-           movie.en.srt
-           movie.eng.srt
-           movie.english.srt
-           movie.en-US.srt
-           movie.en-GB.srt
+    Args:
+        video_path: kept for signature compatibility with callers; not
+            used for any filename-based lookup.
+        explicit_path: subtitle path that must exist.
 
     Returns:
-        str path to subtitle file, or None.
+        str path to subtitle file, or None if explicit_path is missing/unset.
     """
 
-    video_path = Path(video_path)
-
-    extensions = [
-        ".srt",
-        ".ass",
-        ".ssa",
-        ".vtt",
-    ]
-
-    # ------------------------------------------------------------------
-    # 1. Explicit subtitle path
-    # ------------------------------------------------------------------
     if explicit_path:
         explicit = Path(str(explicit_path))
 
         if explicit.exists() and explicit.is_file():
             return str(explicit)
-
-    # ------------------------------------------------------------------
-    # 2. Exact movie filename
-    # ------------------------------------------------------------------
-    for extension in extensions:
-        candidate = video_path.with_suffix(extension)
-
-        if candidate.exists() and candidate.is_file():
-            return str(candidate)
-
-    # ------------------------------------------------------------------
-    # 3. Common language suffixes
-    # ------------------------------------------------------------------
-    language_suffixes = [
-        ".en",
-        ".eng",
-        ".english",
-        ".en-US",
-        ".en-GB",
-    ]
-
-    for suffix in language_suffixes:
-        for extension in extensions:
-            candidate = video_path.with_name(
-                video_path.stem
-                + suffix
-                + extension
-            )
-
-            if candidate.exists() and candidate.is_file():
-                return str(candidate)
 
     return None
 

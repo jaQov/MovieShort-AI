@@ -11,7 +11,12 @@ import config
 from analyzers.text_analyzer import call_llm
 from analyzers.visual_analyzer import is_visually_interesting
 from core.pipeline import process_multiple
-from core.subtitle import find_external_subtitle, load_segments_json
+from core.subtitle import (
+    find_external_subtitle,
+    load_external_subtitles,
+    load_segments_json,
+    save_segments_json,
+)
 from utils import get_video_basename
 
 
@@ -22,28 +27,41 @@ _CREDITS_RE = re.compile(
     re.I,
 )
 
+# SDH bracketed/parenthetical sound cue, e.g. "[gunshot]", "(door slams)" —
+# real signal about what's happening on screen even with zero spoken dialogue,
+# so it should never be treated the same as true silence.
+_SDH_SOUND_CUE_RE = re.compile(r'[\[(][^\])]{2,60}[\])]')
+
 
 def _is_credit_or_silent(block):
     """True if block should be filtered out entirely.
 
     Credits/junk subtitle text is always filtered, regardless of visuals.
     A block with little/no dialogue (<30 chars) or mostly silent audio is
-    ONLY filtered if its visual description (from the vision model, see
-    analyzers/visual_analyzer.py) also shows nothing interesting — a real
-    fight, chase, or silent emotional beat can carry a clip even with no
-    dialogue at all, which text-only analysis used to miss entirely.
+    ONLY filtered if it ALSO has no other signal that something's actually
+    happening:
+      - its visual description (from the vision model, see
+        analyzers/visual_analyzer.py) shows nothing interesting, AND
+      - it has no SDH bracketed sound/action cue ("[gunshot]", "(door
+        slams)") — those are real signal on their own, even with zero
+        spoken dialogue and no visual analysis available for that block.
+    A real fight, chase, or silent emotional beat can carry a clip even
+    with no dialogue at all, which text-only analysis used to miss
+    entirely.
     """
     text = (block.get("text") or "").strip()
     if _CREDITS_RE.search(text):
         return True
 
     visually_interesting = is_visually_interesting(block.get("visual"))
+    has_sound_cue = bool(_SDH_SOUND_CUE_RE.search(text))
 
-    if (not text or len(text) < 30) and not visually_interesting:
+    if (not text or len(text) < 30) and not visually_interesting and not has_sound_cue:
         return True
 
     audio_peaks = block.get("audio_peaks") or {}
-    if audio_peaks.get("silence_ratio", 0) > 0.85 and not visually_interesting:
+    if (audio_peaks.get("silence_ratio", 0) > 0.85
+            and not visually_interesting and not has_sound_cue):
         return True
 
     return False
@@ -74,7 +92,19 @@ def process_movie(video_path, settings=None):
               every clip is a fixed 120-180s, see config.DEFAULT_MIN/MAX_CLIP_DURATION.
             - subtitles (bool): enable subtitles (default True)
             - face_tracking (bool): enable face tracking (default True)
-            - subtitle_path (str): external subtitle file (required)
+            - srt_subtitle_path (str): REQUIRED — plain dialogue-only
+              subtitle file, used ONLY for the burned-in captions on the
+              final rendered clip.
+            - sdh_subtitle_path (str): REQUIRED — SDH subtitle file, used
+              ONLY for scene analysis / clip selection. Never burned in
+              (an SDH tag like "[grunting]" must never appear as a caption).
+              Both subtitle files are required with no auto-discovery
+              fallback — see core/subtitle.py's find_external_subtitle.
+            - series_context / season_context / episode_context (str):
+              optional background info (plot, characters, spoilers allowed)
+              fed to the LLM alongside the auto-generated story primer, to
+              give it real narrative grounding instead of judging each
+              block of dialogue in isolation.
             - anti_copyright (bool): enable anti-copyright measures
             - blur_background (bool): enable blurred background
             - banner_top (int): top banner padding
@@ -109,17 +139,27 @@ def process_movie(video_path, settings=None):
           f"clip length = {min_duration}-{max_duration}s")
     print()
 
-    subtitle_path = find_external_subtitle(
-        video_path,
-        explicit_path=settings.get("subtitle_path"),
+    # Both subtitle files are required — no auto-discovery fallback (see
+    # core/subtitle.py's find_external_subtitle). SDH feeds scene analysis
+    # only; the plain file feeds only the burned-in captions.
+    srt_subtitle_path = find_external_subtitle(
+        video_path, explicit_path=settings.get("srt_subtitle_path"),
     )
-    if not subtitle_path:
-        print("❌ Missing subtitles: no matching subtitle file was found "
-              "next to the video, and none was uploaded.")
-        print("   Supported formats: .srt, .ass, .ssa, .vtt")
+    sdh_subtitle_path = find_external_subtitle(
+        video_path, explicit_path=settings.get("sdh_subtitle_path"),
+    )
+    if not srt_subtitle_path or not sdh_subtitle_path:
+        missing = []
+        if not srt_subtitle_path:
+            missing.append("plain subtitle file (for burned-in captions)")
+        if not sdh_subtitle_path:
+            missing.append("SDH subtitle file (for scene analysis)")
+        print(f"❌ Missing subtitles: no {' and no '.join(missing)} was uploaded.")
+        print("   Both are required — supported formats: .srt, .ass, .ssa, .vtt")
         print("Stopping.")
         return []
-    print(f"Using subtitles: {os.path.basename(subtitle_path)}")
+    print(f"Using subtitles: {os.path.basename(srt_subtitle_path)} (captions), "
+          f"{os.path.basename(sdh_subtitle_path)} (SDH, analysis)")
 
     # Step 1: Find best clips
     print("=" * 50)
@@ -131,7 +171,10 @@ def process_movie(video_path, settings=None):
         max_duration, min_duration,
         num_clips=settings.get("num_clips", config.DEFAULT_NUM_CLIPS),
         score_threshold=settings.get("score_threshold", 7.0),
-        subtitle_path=subtitle_path,
+        sdh_subtitle_path=sdh_subtitle_path,
+        series_context=settings.get("series_context", ""),
+        season_context=settings.get("season_context", ""),
+        episode_context=settings.get("episode_context", ""),
     )
     if best_scenes is None:
         print("❌ The AI scene analysis didn't produce a result — see the "
@@ -147,27 +190,30 @@ def process_movie(video_path, settings=None):
     print(f"STEP 2: Rendering {len(best_scenes)} clip(s) to vertical video")
     print("=" * 50)
 
-    # Step 1 already parsed the subtitles into this cache file — reuse it
-    # instead of re-parsing, and to feed filter_segments_in_range() per clip.
+    # Parse the PLAIN subtitle file into its own cache — deliberately
+    # separate from the SDH cache Step 1 built internally — so burned-in
+    # captions can never show an SDH-only tag like "[grunting]". Cached by
+    # content hash exactly like the SDH one, so re-running the same episode
+    # doesn't re-parse.
     import hashlib
-    transcript_json = None
     video_basename = get_video_basename(video_path)
     hash_input = (
         f"{video_path}_"
-        f"{subtitle_path}_"
-        f"{os.path.getmtime(subtitle_path)}"
+        f"{srt_subtitle_path}_"
+        f"{os.path.getmtime(srt_subtitle_path)}"
     )
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-    expected = str(config.CACHE_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
-    if os.path.exists(expected):
-        transcript_json = expected
-
-    if not transcript_json:
-        print("❌ Missing subtitles: Step 1's parsed-subtitle cache is "
-              "gone or couldn't be written — can't burn in captions "
-              "without it.")
-        print("Stopping.")
-        return []
+    transcript_json = str(config.CACHE_DIR / f"full_transcript_srt_{video_basename}_{file_hash}.json")
+    if not os.path.exists(transcript_json):
+        try:
+            srt_segments = load_external_subtitles(srt_subtitle_path)
+            os.makedirs(config.CACHE_DIR, exist_ok=True)
+            save_segments_json(srt_segments, transcript_json)
+        except Exception as e:
+            print(f"❌ Missing subtitles: couldn't parse the plain subtitle "
+                  f"file for burned-in captions: {e}")
+            print("Stopping.")
+            return []
 
     # Pre-load transcript segments for smart clip centering
     clip_segments = None
@@ -214,7 +260,6 @@ def process_movie(video_path, settings=None):
         "blur_background": settings.get("blur_background", config.DEFAULT_BLUR_BACKGROUND),
         "banner_top": settings.get("banner_top", config.DEFAULT_BANNER_TOP),
         "banner_bottom": settings.get("banner_bottom", config.DEFAULT_BANNER_BOTTOM),
-        "subtitle_path": subtitle_path,
     }
     # R7b-7: Editor subtitle style flows to final clips (same font_style path as render_full_preview)
     for _k in ("subtitle_font", "subtitle_font_name", "subtitle_size", "subtitle_outline", "subtitle_color", "subtitle_bold", "subtitle_italic", "subtitle_shadow", "subtitle_position_y", "font_style"):
@@ -564,10 +609,45 @@ def _split_batches(blocks, batch_size, content_budget):
     return batches
 
 
+# Soft cap on each user-supplied context field — this text gets added to
+# EVERY batch call (not just once), so a giant pasted synopsis would eat
+# real budget from every single request. ~700 chars is roughly 150-200
+# words, matching the length asked for in the prompts suggested for
+# generating this content externally.
+_CONTEXT_FIELD_CHAR_CAP = 700
+
+
+def _build_context_block(series_context, season_context, episode_context, story_primer):
+    """Combine the auto-generated primer with whatever series/season/episode
+    context was supplied into one preamble block for the batch prompt.
+
+    Returns "" (no section at all) if nothing was supplied — the prompt
+    template's {context_block} placeholder then contributes nothing, and
+    scoring behaves exactly as it did before this feature existed.
+    """
+    parts = []
+    if story_primer:
+        parts.append(f"Story summary (auto-generated from this episode's "
+                      f"subtitles): {story_primer.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+    if series_context and series_context.strip():
+        parts.append(f"Series background: {series_context.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+    if season_context and season_context.strip():
+        parts.append(f"Season background: {season_context.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+    if episode_context and episode_context.strip():
+        parts.append(f"Episode background: {episode_context.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+
+    if not parts:
+        return ""
+
+    return "Background info (use this to judge what actually matters):\n" + "\n\n".join(parts) + "\n\n"
+
+
 def find_best_clips_context(video_path, movie_title,
                             max_duration=180, min_duration=60,
                             num_clips=10, score_threshold=7.0,
-                            subtitle_path=None):
+                            sdh_subtitle_path=None,
+                            series_context="", season_context="",
+                            episode_context=""):
     """Context mode: detect blocks → local LLM splits each block into sub-clips.
 
     Each block from detect_and_transcribe() carries metadata:
@@ -582,7 +662,12 @@ def find_best_clips_context(video_path, movie_title,
         min_duration: min clip length in seconds
         num_clips: max number of clips to return (default 10)
         score_threshold: minimum score (default 7.0)
-        subtitle_path: required external subtitle file used for analysis
+        sdh_subtitle_path: required SDH subtitle file used for analysis
+        series_context / season_context / episode_context: optional
+            user-supplied background info (spoilers allowed), combined with
+            an auto-generated story primer (see _build_context_block) and
+            fed to every batch call so the LLM judges blocks with real
+            narrative grounding instead of in total isolation.
 
     Returns list of {start, end, duration, text, score, title} or None.
     """
@@ -590,19 +675,23 @@ def find_best_clips_context(video_path, movie_title,
     from pathlib import Path
 
     from analyzers.scene_analyzer import detect_and_transcribe
-    from analyzers.text_analyzer import PROMPT_BATCH_TO_CLIPS, _parse_batch_response
+    from analyzers.text_analyzer import (
+        PROMPT_BATCH_TO_CLIPS,
+        _parse_batch_response,
+        generate_story_primer,
+    )
 
     video_basename = Path(video_path).stem
     total_start = time.time()
     print(f"\n🎬 Analyzing \"{video_basename}\" to find the best {min_duration}-"
           f"{max_duration}s clips...")
 
-    # Step 1: Detect scenes and map the external subtitle file to them.
+    # Step 1: Detect scenes and map the external SDH subtitle file to them.
     print("  Detecting visual scene changes and matching them to the "
-          "subtitle file's dialogue...")
+          "SDH subtitle file's dialogue and sound cues...")
     blocks = detect_and_transcribe(
         video_path,
-        subtitle_path=subtitle_path,
+        sdh_subtitle_path=sdh_subtitle_path,
     )
 
     if not blocks:
@@ -649,12 +738,35 @@ def find_best_clips_context(video_path, movie_title,
         print("  Nothing left with actual dialogue in it — nothing to process.")
         return None
 
+    # Step 1.65: Auto-generated story primer + background context.
+    #
+    # One extra LLM call, made ONCE for the whole movie/episode (not per
+    # block): summarizes the surviving blocks' actual dialogue into a short
+    # plot/character primer, grounded in real transcript text rather than
+    # the model's own training-data guesses. Combined with whatever
+    # series/season/episode context was supplied, this becomes a fixed
+    # preamble prepended to every batch call below, so each block is judged
+    # with real narrative context instead of in total isolation.
+    print("  Summarizing the full transcript into a short story primer, so "
+          "the AI has real plot/character context when judging each "
+          "section (not just that section's own dialogue)...")
+    full_transcript_text = "\n".join(
+        b.get("text", "").strip() for b in blocks if b.get("text", "").strip()
+    )
+    story_primer = generate_story_primer(full_transcript_text, movie_title)
+    if story_primer:
+        print(f"  ✓ Story primer: {story_primer[:150]}"
+              f"{'...' if len(story_primer) > 150 else ''}")
+    context_block = _build_context_block(
+        series_context, season_context, episode_context, story_primer
+    )
+
     model = config.OLLAMA_MODEL
     batch_size = _batch_size_for_model(model)
     batch_template = PROMPT_BATCH_TO_CLIPS
     all_sub_clips = []
     batches = _split_batches(blocks, batch_size,
-                             _max_prompt_chars(model) - len(batch_template))
+                             _max_prompt_chars(model) - len(batch_template) - len(context_block))
     total_batches = len(batches)
 
     # Step 2: Process blocks in batches through LLM
@@ -699,6 +811,7 @@ def find_best_clips_context(video_path, movie_title,
         blocks_text = "\n\n".join(block_texts)
         prompt = batch_template.format(
             movie_name=movie_title,
+            context_block=context_block,
             blocks_text=blocks_text,
             min_duration=min_duration,
             max_duration=max_duration,
@@ -771,6 +884,7 @@ def find_best_clips_context(video_path, movie_title,
                     )
                 sub_prompt = batch_template.format(
                     movie_name=movie_title,
+                    context_block=context_block,
                     blocks_text="\n\n".join(sub_texts),
                     min_duration=min_duration,
                     max_duration=max_duration,

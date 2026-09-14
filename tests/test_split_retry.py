@@ -37,6 +37,9 @@ def test_split_retry_on_null_batch(monkeypatch):
     monkeypatch.setattr(cb, "_split_batches", lambda blocks, bs, budget: [blocks])
     # no real ffmpeg/Ollama vision calls in tests — pass blocks through untouched
     monkeypatch.setattr("analyzers.visual_analyzer.describe_blocks", lambda video_path, blocks, *a, **kw: blocks)
+    # no real extra call_llm() round-trip for the story primer — it would
+    # shift the fake_call() sequence below by one and break the assertions
+    monkeypatch.setattr("analyzers.text_analyzer.generate_story_primer", lambda transcript_text, movie_title: "")
 
     # mock detect_and_transcribe to return our blocks, no file IO
     monkeypatch.setattr("analyzers.scene_analyzer.detect_and_transcribe", lambda *a, **kw: blocks4)
@@ -90,6 +93,7 @@ def test_single_block_null_no_loop(monkeypatch):
     monkeypatch.setattr(cb, "_is_credit_or_silent", lambda b: False)
     monkeypatch.setattr(cb, "_split_batches", lambda blocks, bs, budget: [blocks])
     monkeypatch.setattr("analyzers.visual_analyzer.describe_blocks", lambda video_path, blocks, *a, **kw: blocks)
+    monkeypatch.setattr("analyzers.text_analyzer.generate_story_primer", lambda transcript_text, movie_title: "")
     monkeypatch.setattr("analyzers.scene_analyzer.detect_and_transcribe", lambda *a, **kw: blocks1)
     # keep validate, fallback uses _find_best_window
     monkeypatch.setattr(cb, "_find_best_window", lambda segs, s, e, md: (s+5, s+35))
